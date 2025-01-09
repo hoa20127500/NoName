@@ -54,8 +54,8 @@ class NoName(nn.Module):
         return np.array(betas)
     def forward(self, heads, rels, tails, day):
         bs = heads.size(0)
-        d_img = torch.sin(self.w.view(1, -1) * (day).unsqueeze(1))
-        d_real = torch.cos(self.w.view(1, -1) * (day).unsqueeze(1))
+        d_img = torch.sin(self.w.view(1, -1) * (day + 0.5).unsqueeze(1))
+        d_real = torch.cos(self.w.view(1, -1) * (day - 0.5).unsqueeze(1))
         rels_embeds_real = d_real * self.encoder1.get_rel_embedding(rels) - d_img * self.encoder2.get_rel_embedding(rels)
         heads_embeds_real = self.encoder1.get_ent_embedding(heads)
         tails_embeds_real = self.encoder1.get_ent_embedding(tails)
@@ -82,7 +82,7 @@ class NoName(nn.Module):
 
     def train_forward(self, heads, rels, tails, year, month, day, neg):
         heads_embs1, rels_embs1, x_start1, \
-        heads_embs2, rels_embs2, x_start2 = self.forward(heads, rels, tails,(month + day%month + year % month))
+        heads_embs2, rels_embs2, x_start2 = self.forward(heads, rels, tails,(month))
         bs = heads.size(0)
         ts = torch.randint(0, self.steps,(bs,))
         d_img = torch.cos(self.w.view(1, -1) * (month + day%month + year % month).unsqueeze(1))
@@ -134,17 +134,17 @@ class NoName(nn.Module):
 
         labels = torch.cat([torch.ones_like(tails).unsqueeze(1), torch.zeros_like(neg)], dim=1)
         #type_intes = (torch.norm(condition_emb - x_start, dim=1).unsqueeze(1) - torch.norm(condition_emb.unsqueeze(1) - ent_embeds, dim=-1))
-        factor = (torch.linalg.norm(heads_embs1 - x_start1, ord = 3, dim=1), torch.linalg.norm(heads_embs2 -x_start2, ord = 3, dim=1),\
-                  torch.linalg.norm(rels_embs1, ord = 3, dim=1),torch.linalg.norm(rels_embs1, ord = 3, dim=1))
+        factor = (torch.linalg.norm(heads_embs1 - x_start1, ord = 2, dim=1), torch.linalg.norm(heads_embs2 -x_start2, ord = 2, dim=1),\
+                  torch.linalg.norm(rels_embs1, ord = 2, dim=1),torch.linalg.norm(rels_embs1, ord = 2, dim=1))
 
         loss_lp =  self.link_prediction_loss(type_intes, ent_type, torch.zeros_like(tails)) + 5 * contrastive_loss(type_intes, labels)
 
-        return loss_lp.mean() + self.emb_regularizer.forward(factor)
+        return loss_lp.mean() + 5 * self.emb_regularizer.forward(factor)
 
 
     def test_forward(self, sub, rels, tails, year, month, day):
         heads_embs1, rels_embs1, _, \
-        heads_embs2, rels_embs2, _  = self.forward(sub, rels, tails, (month + day%month + year % month))
+        heads_embs2, rels_embs2, _  = self.forward(sub, rels, tails, (month))
         d_img = torch.cos(self.w.view(1, -1) * (month + day%month + year % month).unsqueeze(1))
         d_real = torch.sin(self.w.view(1, -1) * (month + day%month + year % month).unsqueeze(1))
         condition_emb1 = self.encoder1(heads_embs1 + rels_embs1, d_real)
