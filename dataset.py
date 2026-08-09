@@ -40,6 +40,7 @@ class Dataset:
         for spl in ["train", "valid", "test"]:
             self.data[spl] = np.array(self.data[spl]).astype(int)
         self.skip_dict = self.get_skipdict(self.data['train'].tolist()+self.data['valid'].tolist() + self.data['test'].tolist())
+        self.time_skip_dict = self.get_time_skipdict(self.data['train'].tolist()+self.data['valid'].tolist() + self.data['test'].tolist())
     def readFile(self,
                  filename):
 
@@ -108,13 +109,19 @@ class Dataset:
         quads_r[:, 5] = quads[:, 5]
         return np.concatenate((quads, quads_r),axis=1).reshape(int(quads_r.shape[0] * 2),6)
     def get_skipdict(self, quadruples):
-        """Used for time-dependent filtered metrics.
-        return: a dict [key -> (entity, relation, timestamp),  value -> a set of ground truth entities]
-        """
+        """Static filter: maps (entity, relation) → set of all ground truth entities across all timestamps."""
         filters = defaultdict(set)
         for src, rel, dst, year, month, day in quadruples:
             filters[(src, rel)].add(dst)
             filters[(dst, rel+self.numRel())].add(src)
+        return filters
+
+    def get_time_skipdict(self, quadruples):
+        """Time filter: maps (entity, relation, year, month, day) → set of ground truth entities at that timestamp."""
+        filters = defaultdict(set)
+        for src, rel, dst, year, month, day in quadruples:
+            filters[(src, rel, year, month, day)].add(dst)
+            filters[(dst, rel+self.numRel(), year, month, day)].add(src)
         return filters
 
 class QuadruplesDataset(Dataset):
