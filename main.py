@@ -4,12 +4,18 @@ import os
 from tqdm import tqdm
 from dataset import *
 from model import NoName
+from models.MatchingFlow import MatchingFlowTKG
 import logging
 from collections import namedtuple
 from torch.utils.data import DataLoader
 from utils import set_logger
 import pickle
 import math
+
+MODEL_REGISTRY = {
+    'DifTKG': NoName,
+    'MatchingFlow': MatchingFlowTKG,
+}
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
@@ -213,7 +219,9 @@ def main(args):
                     d_model=args.d_model,
                     dropout=args.dropout,
                     s_emb_dim = 64,t_emb_dim = 36)
-    model = NoName(config)
+    if args.model_name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model '{args.model_name}'. Valid: {list(MODEL_REGISTRY.keys())}")
+    model = MODEL_REGISTRY[args.model_name](config)
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
