@@ -10,15 +10,15 @@ import copy
 import time
 import numpy as np
 from random import shuffle
-from scripts import shredFacts
+from collections import defaultdict
 
 class Dataset:
     """Implements the specified dataloader"""
-    def __init__(self, 
+    def __init__(self,
                  ds_name):
         """
         Params:
-                ds_name : name of the dataset 
+                ds_name : name of the dataset
         """
         self.name = ds_name
         # self.ds_path = "<path-to-dataset>" + ds_name.lower() + "/"
@@ -28,119 +28,114 @@ class Dataset:
         self.data = {"train": self.readFile(self.ds_path + "train.txt"),
                      "valid": self.readFile(self.ds_path + "valid.txt"),
                      "test":  self.readFile(self.ds_path + "test.txt")}
-        
+
+
         self.start_batch = 0
         self.all_facts_as_tuples = None
-        
+
         self.convertTimes()
-        
+
         self.all_facts_as_tuples = set([tuple(d) for d in self.data["train"] + self.data["valid"] + self.data["test"]])
-        
+
         for spl in ["train", "valid", "test"]:
-            self.data[spl] = np.array(self.data[spl])
-        
-    def readFile(self, 
+            self.data[spl] = np.array(self.data[spl]).astype(int)
+        self.skip_dict = self.get_skipdict(self.data['train'].tolist()+self.data['valid'].tolist() + self.data['test'].tolist())
+        self.time_skip_dict = self.get_time_skipdict(self.data['train'].tolist()+self.data['valid'].tolist() + self.data['test'].tolist())
+    def readFile(self,
                  filename):
 
         with open(filename, "r") as f:
             data = f.readlines()
-        
+
         facts = []
         for line in data:
             elements = line.strip().split("\t")
-            
+
             head_id =  self.getEntID(elements[0])
             rel_id  =  self.getRelID(elements[1])
             tail_id =  self.getEntID(elements[2])
             timestamp = elements[3]
-            
+
             facts.append([head_id, rel_id, tail_id, timestamp])
-            
+
         return facts
-    
-    
-    def convertTimes(self):      
+
+
+    def convertTimes(self):
         """
         This function spits the timestamp in the day,date and time.
-        """  
+        """
         for split in ["train", "valid", "test"]:
             for i, fact in enumerate(self.data[split]):
                 fact_date = fact[-1]
                 self.data[split][i] = self.data[split][i][:-1]
                 date = list(map(float, fact_date.split("-")))
                 self.data[split][i] += date
-                
-                
-    
+
+
+
     def numEnt(self):
-    
+
         return len(self.ent2id)
 
     def numRel(self):
-    
+
         return len(self.rel2id)
 
-    
+
     def getEntID(self,
                  ent_name):
 
         if ent_name in self.ent2id:
-            return self.ent2id[ent_name] 
+            return self.ent2id[ent_name]
         self.ent2id[ent_name] = len(self.ent2id)
         return self.ent2id[ent_name]
-    
+
     def getRelID(self, rel_name):
         if rel_name in self.rel2id:
-            return self.rel2id[rel_name] 
+            return self.rel2id[rel_name]
         self.rel2id[rel_name] = len(self.rel2id)
         return self.rel2id[rel_name]
 
-    
-    def nextPosBatch(self, batch_size):
-        if self.start_batch + batch_size > len(self.data["train"]):
-            ret_facts = self.data["train"][self.start_batch : ]
-            self.start_batch = 0
-        else:
-            ret_facts = self.data["train"][self.start_batch : self.start_batch + batch_size]
-            self.start_batch += batch_size
-        return ret_facts
-    
+    @staticmethod
+    def get_reverse_quadruples_array(quadruples, num_r):
+        quads = np.copy(quadruples)
+        quads_r = np.zeros_like(quads)
+        quads_r[:, 1] = num_r + quads[:, 1]
+        quads_r[:, 0] = quads[:, 2]
+        quads_r[:, 2] = quads[:, 0]
+        quads_r[:, 3] = quads[:, 3]
+        quads_r[:, 4] = quads[:, 4]
+        quads_r[:, 5] = quads[:, 5]
+        return np.concatenate((quads, quads_r),axis=1).reshape(int(quads_r.shape[0] * 2),6)
+    def get_skipdict(self, quadruples):
+        """Static filter: maps (entity, relation) → set of all ground truth entities across all timestamps."""
+        filters = defaultdict(set)
+        for src, rel, dst, year, month, day in quadruples:
+            filters[(src, rel)].add(dst)
+            filters[(dst, rel+self.numRel())].add(src)
+        return filters
 
-    def addNegFacts(self, bp_facts, neg_ratio):
-        ex_per_pos = 2 * neg_ratio + 2
-        facts = np.repeat(np.copy(bp_facts), ex_per_pos, axis=0)
-        for i in range(bp_facts.shape[0]):
-            s1 = i * ex_per_pos + 1
-            e1 = s1 + neg_ratio
-            s2 = e1 + 1
-            e2 = s2 + neg_ratio
-            
-            facts[s1:e1,0] = (facts[s1:e1,0] + np.random.randint(low=1, high=self.numEnt(), size=neg_ratio)) % self.numEnt()
-            facts[s2:e2,2] = (facts[s2:e2,2] + np.random.randint(low=1, high=self.numEnt(), size=neg_ratio)) % self.numEnt()
-            
-        return facts
-    
-    def addNegFacts2(self, bp_facts, neg_ratio):
-        pos_neg_group_size = 1 + neg_ratio
-        facts1 = np.repeat(np.copy(bp_facts), pos_neg_group_size, axis=0)
-        facts2 = np.copy(facts1)
-        rand_nums1 = np.random.randint(low=1, high=self.numEnt(), size=facts1.shape[0])
-        rand_nums2 = np.random.randint(low=1, high=self.numEnt(), size=facts2.shape[0])
-        
-        for i in range(facts1.shape[0] // pos_neg_group_size):
-            rand_nums1[i * pos_neg_group_size] = 0
-            rand_nums2[i * pos_neg_group_size] = 0
-        
-        facts1[:,0] = (facts1[:,0] + rand_nums1) % self.numEnt()
-        facts2[:,2] = (facts2[:,2] + rand_nums2) % self.numEnt()
-        return np.concatenate((facts1, facts2), axis=0)
-    
-    def nextBatch(self, batch_size, neg_ratio=1):
-        bp_facts = self.nextPosBatch(batch_size)
-        batch = shredFacts(self.addNegFacts2(bp_facts, neg_ratio))
-        return batch
-    
-    
-    def wasLastBatch(self):
-        return (self.start_batch == 0)
-            
+    def get_time_skipdict(self, quadruples):
+        """Time filter: maps (entity, relation, year, month, day) → set of ground truth entities at that timestamp."""
+        filters = defaultdict(set)
+        for src, rel, dst, year, month, day in quadruples:
+            filters[(src, rel, year, month, day)].add(dst)
+            filters[(dst, rel+self.numRel(), year, month, day)].add(src)
+        return filters
+
+class QuadruplesDataset(Dataset):
+    def __init__(self, quadruples, dataset, dataset_type='train'):
+        self.quadruples = quadruples
+        self.PAD_TIME = -1
+        self.num_r = dataset.numRel()
+        self.dataset_type = dataset_type
+        self.dataset = dataset
+    def __len__(self):
+        return len(self.quadruples)
+
+    def __getitem__(self, idx):
+        quad = self.quadruples[idx]
+        head_entity, relation, tail_entity, year, month, day = quad[0], quad[1], quad[2], quad[3], quad[4], quad[5]
+        neg = np.random.randint(self.dataset.numEnt(), size=(500))
+        return head_entity, relation, tail_entity, year, month, day, neg

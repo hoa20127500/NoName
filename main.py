@@ -1,68 +1,280 @@
-# Copyright (c) 2018-present, Royal Bank of Canada.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-#
 import argparse
-from dataset import Dataset
-from trainer import Trainer
-from tester import Tester
-from params import Params
+import torch
+import os
+from tqdm import tqdm
+from dataset import *
+from model import NoName
+from models.MatchingFlow import MatchingFlowTKG
+import logging
+from collections import namedtuple
+from torch.utils.data import DataLoader
+from utils import set_logger
+import pickle
+import math
 
-desc = 'Temporal KG Completion methods'
-parser = argparse.ArgumentParser(description=desc)
+MODEL_REGISTRY = {
+    'DifTKG': NoName,
+    'MatchingFlow': MatchingFlowTKG,
+}
 
-parser.add_argument('-dataset', help='Dataset', type=str, default='icews14', choices = ['icews14', 'icews05-15', 'gdelt'])
-parser.add_argument('-model', help='Model', type=str, default='DE_DistMult', choices = ['DE_DistMult', 'DE_TransE', 'DE_SimplE', 'MatchingFlow'])
-parser.add_argument('-ne', help='Number of epochs', type=int, default=500, choices = [500])
-parser.add_argument('-bsize', help='Batch size', type=int, default=512, choices = [512])
-parser.add_argument('-lr', help='Learning rate', type=float, default=0.001, choices = [0.001])
-parser.add_argument('-reg_lambda', help='L2 regularization parameter', type=float, default=0.0, choices = [0.0])
-parser.add_argument('-emb_dim', help='Embedding dimension', type=int, default=100, choices = [100])
-parser.add_argument('-neg_ratio', help='Negative ratio', type=int, default=500, choices = [500])
-parser.add_argument('-dropout', help='Dropout probability', type=float, default=0.4, choices = [0.0, 0.1, 0.2, 0.4])
-parser.add_argument('-save_each', help='Save model and validate each K epochs', type=int, default=20, choices = [20])
-parser.add_argument('-se_prop', help='Static embedding proportion', type=float, default=0.36)
-parser.add_argument('-ode_steps', help='MatchingFlow Euler steps (1 is fastest; 4–8 can raise MRR)', type=int, default=1)
+def parse_args(args=None):
+    parser = argparse.ArgumentParser(
+        description='Training and Testing Temporal Knowledge Graph Reasoning Models',
+        usage='main.py [<args>] [-h | --help]'
+    )
 
-args = parser.parse_args()
+    parser.add_argument('--data_root', type=str, default='data')
+    parser.add_argument('--output_root', type=str, default='output')
+    parser.add_argument('--model_name', type=str, default='DifTKG')
+    parser.add_argument('--batch_size', type=int, default=256)
 
-dataset = Dataset(args.dataset)
+    parser.add_argument('--num_works', type=int, default=2)
 
-params = Params(
-    ne=args.ne, 
-    bsize=args.bsize, 
-    lr=args.lr, 
-    reg_lambda=args.reg_lambda, 
-    emb_dim=args.emb_dim, 
-    neg_ratio=args.neg_ratio, 
-    dropout=args.dropout, 
-    save_each=args.save_each, 
-    se_prop=args.se_prop,
-    ode_steps=args.ode_steps
-)
+    parser.add_argument('--grad_norm', type=float, default=1.0)
+    parser.add_argument('--weight_decay', type=float, default=0.000001)
 
-trainer = Trainer(dataset, params, args.model)
-trainer.train()
+    parser.add_argument('--d_model', default=200, type=int)
+    parser.add_argument('--data', default='icews14', type=str)
+    parser.add_argument('--max_epochs', default=31, type=int)
+    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--do_train', action='store_true')
+    parser.add_argument('--do_test', action='store_true')
+    parser.add_argument('--valid_epoch', default=3, type=int)
+    parser.add_argument('--dropout', default=0.1, type=float)
+    parser.add_argument(
+        '--ode_steps', default=1, type=int,
+        help='MatchingFlow Euler steps at test (1 is fastest; 4–8 can raise MRR)',
+    )
 
-# validating the trained models. we seect the model that has the best validation performance as the fina model
-validation_idx = [str(int(args.save_each * (i + 1))) for i in range(args.ne // args.save_each)]
-best_mrr = -1.0
-best_index = '0'
-model_prefix = "models/" + args.model + "/" + args.dataset + "/" + params.str_() + "_"
+    parser.add_argument('--load_model_path', default='output1', type=str)
 
-for idx in validation_idx:
-    model_path = model_prefix + idx + ".chkpnt"
-    tester = Tester(dataset, model_path, "valid")
-    mrr = tester.test()
-    if mrr > best_mrr:
-        best_mrr = mrr
-        best_index = idx
+    parser.add_argument('--forecasting_t_win_size', default=1, type=int)
 
-# testing the best chosen model on the test set
-print("Best epoch: " + best_index)
-model_path = model_prefix + best_index + ".chkpnt"
-tester = Tester(dataset, model_path, "test")
-tester.test()
+    parser.add_argument('--warm_up', default=0.0, type=float)
 
+    return parser.parse_args(args)
+
+def test(model, testloader, dataset, device):
+    model.eval()
+    ranks = []
+    logs = []
+    #device = 'cpu'
+    model.to(device)
+    with torch.no_grad():
+        for sub, rel, obj, year,month,day, neg in tqdm(testloader):
+            sub = sub.to(device, non_blocking=True)
+            rel = rel.to(device, non_blocking=True)
+            obj = obj.to(device, non_blocking=True)
+            year = year.to(device, non_blocking=True)
+            month = month.to(device, non_blocking=True)
+            day = day.to(device, non_blocking=True)
+            #break
+            scores = model.test_forward(sub, rel, obj, year, month, day)
+            _, rank_idx = scores.sort(dim=1, descending=True)
+            rank = torch.nonzero(rank_idx == obj.view(-1, 1))[:, 1].view(-1)
+            ranks.append(rank)
+            for i in range(scores.shape[0]):
+                src_i = sub[i].item()
+                rel_i = rel[i].item()
+                dst_i = obj[i].item()
+                year_i = year[i].item()
+                month_i = month[i].item()
+                day_i = day[i].item()
+
+                predict_score = scores[i].tolist()
+                answer_prob = predict_score[dst_i]
+                for e in dataset.skip_dict[(src_i, rel_i)]:
+                    if e != dst_i:
+                        predict_score[e] = -1e6
+                predict_score.sort(reverse=True)
+                filter_rank = predict_score.index(answer_prob) + 1
+
+                predict_score = scores[i].tolist()
+                for e in dataset.time_skip_dict[(src_i, rel_i,year_i, month_i, day_i)]:
+                    if e != dst_i:
+                        predict_score[e] = -1e6
+                predict_score.sort(reverse=True)
+                filter_rank1 = predict_score.index(answer_prob) + 1
+
+                logs.append({
+                        'Static Filter MR': filter_rank,
+                        'Static Filter MRR': 1.0 / filter_rank,
+                        'Static Filter HITS@1': 1.0 if filter_rank <= 1 else 0.0,
+                        'Static Filter HITS@3': 1.0 if filter_rank <= 3 else 0.0,
+                        'Static Filter HITS@10': 1.0 if filter_rank <= 10 else 0.0,
+
+                        'Time Filter MR': filter_rank1,
+                        'Time Filter MRR': 1.0 / filter_rank1,
+                        'Time Filter HITS@1': 1.0 if filter_rank1 <= 1 else 0.0,
+                        'Time Filter HITS@3': 1.0 if filter_rank1 <= 3 else 0.0,
+                        'Time Filter HITS@10': 1.0 if filter_rank1 <= 10 else 0.0,
+                    })
+
+    metrics = {}
+    ranks = torch.cat(ranks)
+    ranks += 1
+    mrr = torch.mean(1.0 / ranks.float())
+    metrics['Raw MRR'] = mrr
+    for hit in [1, 3, 10]:
+        avg_count = torch.mean((ranks <= hit).float())
+        metrics['Raw Hit@{}'.format(hit)] = avg_count
+
+    for metric in logs[0].keys():
+        metrics[metric] = sum([log[metric] for log in logs]) / len(logs)
+    return metrics
+
+
+def train_epoch(args, model, traindataloader, optimizer, scheduler, device, epoch):
+    model.train()
+    with tqdm(total=len(traindataloader), unit='ex') as bar:
+        bar.set_description('Train')
+        total_loss = 0
+        total_num = 0
+        for sub, rel, obj, year, month, day, neg in traindataloader:
+            bs = sub.size(0)
+            sub = sub.to(device, non_blocking=True)
+            rel = rel.to(device, non_blocking=True)
+            obj = obj.to(device, non_blocking=True)
+            year = year.to(device, non_blocking=True)
+            month = month.to(device, non_blocking=True)
+            day = day.to(device, non_blocking=True)
+            neg = neg.to(device, non_blocking=True)
+            #break
+            loss = model.train_forward(sub, rel, obj, year, month, day, neg)
+            loss.backward()
+
+            total_loss += loss
+            total_num += 1
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            bar.update(1)
+            bar.set_postfix(loss='%.4f' % loss)
+
+        logging.info('Epoch {} Train Loss: {}'.format(epoch, total_loss/total_num))
+
+
+class WarmUpLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, total_iters, last_epoch=-1):
+        self.total_iters = total_iters
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        return [base_lr * self.last_epoch / (self.total_iters + 1e-8) for base_lr in self.base_lrs]
+
+
+def main(args):
+    output_path = os.path.join(args.output_root, '{0}_{1}'.format(args.data, args.model_name))
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    log_file = os.path.join(output_path, 'log.txt')
+    set_logger(log_file)
+
+    logging.info(args)
+
+    if torch.cuda.is_available():
+        device = 'cuda'
+    else:
+        device = 'cpu'
+
+    data_path = os.path.join(args.data_root, args.data)
+    trainpath = os.path.join(data_path, 'train.txt')
+    validpath = os.path.join(data_path, 'valid.txt')
+    testpath = os.path.join(data_path, 'test.txt')
+    statpath = os.path.join(data_path, 'stat.txt')
+    dataset = Dataset(args.data)
+
+    trainQuadruples = dataset.get_reverse_quadruples_array(dataset.data['train'],dataset.numRel())
+    trainQuadDataset = QuadruplesDataset(trainQuadruples, dataset, 'train')
+    trainDataLoader = DataLoader(
+        trainQuadDataset,
+        shuffle=True,
+        batch_size=args.batch_size,
+        num_workers=args.num_works,
+        pin_memory=True
+    )
+
+
+    validQuadruples = dataset.get_reverse_quadruples_array(dataset.data['valid'],dataset.numRel())
+    validQuadDataset  = QuadruplesDataset(validQuadruples, dataset, 'valid')
+    validDataLoader = DataLoader(
+        validQuadDataset,
+        shuffle=False,
+        batch_size=args.batch_size,
+        num_workers=args.num_works,
+        pin_memory=True
+    )
+
+    testQuadruples = dataset.get_reverse_quadruples_array(dataset.data['test'],dataset.numRel())
+    testQuadDataset = QuadruplesDataset(testQuadruples, dataset, 'test')
+    testDataLoader = DataLoader(
+        testQuadDataset,
+        shuffle=False,
+        batch_size=args.batch_size,
+        num_workers=args.num_works,
+        pin_memory=True
+    )
+
+    Config = namedtuple('config', ['n_ent', 'd_model', 'n_rel', 'dropout','s_emb_dim','t_emb_dim'])
+    config = Config(n_ent=dataset.numEnt() + 1,
+                    n_rel=dataset.numRel() * 2,
+                    d_model=args.d_model,
+                    dropout=args.dropout,
+                    s_emb_dim = 64,t_emb_dim = 36)
+    if args.model_name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model '{args.model_name}'. Valid: {list(MODEL_REGISTRY.keys())}")
+    model_cls = MODEL_REGISTRY[args.model_name]
+    if args.model_name == 'MatchingFlow':
+        model = model_cls(config, ode_steps=args.ode_steps)
+    else:
+        model = model_cls(config)
+    model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.warm_up > 0:
+        warmup_scheduler = WarmUpLR(optimizer, len(trainDataLoader) * args.warm_up)
+    else:
+        warmup_scheduler = None
+
+    if os.path.isfile(args.load_model_path):
+        params = torch.load(args.load_model_path)
+        model.load_state_dict(params['model_state_dict'])
+        optimizer.load_state_dict(params['optimizer_state_dict'])
+        logging.info('Load pretrain model: {}'.format(args.load_model_path))
+
+    if args.do_train:
+        logging.info('Start Training......')
+
+        for i in range(args.max_epochs):
+            if i % args.valid_epoch == 0 and i != 0:
+                model_save_path = os.path.join(output_path, 'model_{}.pth'.format(i))
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, model_save_path)
+
+                for delta_t in range(args.forecasting_t_win_size):
+                    delta_t = delta_t + 1
+                    testDataLoader.dataset.delta_t = delta_t
+                    metrics = test(model, testDataLoader, dataset, device)
+
+                    for mode in metrics.keys():
+                        logging.info('Delta_t {} Valid {} : {}'.format(delta_t, mode, metrics[mode]))
+
+            train_epoch(args, model, trainDataLoader, optimizer, warmup_scheduler, device, i)
+
+    if args.do_test:
+        logging.info('Start Testing......')
+        for delta_t in range(args.forecasting_t_win_size):
+            delta_t = delta_t + 1
+            testDataLoader.dataset.delta_t = delta_t
+            metrics = test(model, testDataLoader, dataset, device)
+            for mode in metrics.keys():
+                logging.info('Delta_t {} Test {} : {}'.format(delta_t, mode, metrics[mode]))
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    main(args)
