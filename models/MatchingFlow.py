@@ -14,7 +14,12 @@ Accuracy:
   FM weight raised to 1.0. VectorField has two hidden layers.
   Raise --ode_steps (e.g. 4) for extra Euler refinement at test.
 
-Loss: CE + contrastive(×5) + FM(×1.0) + N3(×5) + w_smooth(×0.01)
+Loss: CE/τ + hard-neg hinge(×2) + contrastive(×1) + FM(×1) + N3(×5) + w_smooth(×0.01)
+
+Hit@1: ranking uses (context ⊙ x_hat) · entity so the flow output
+affects who ranks first (the previous c·x − c·e score made x_hat a
+per-query constant). A hinge on the hardest negative pushes the true
+tail above its strongest rival.
 """
 
 import math
@@ -128,6 +133,8 @@ class MatchingFlowTKG(nn.Module):
 
         self.emb_regularizer = N3(0.004)
         self.lp_loss_fn      = nn.CrossEntropyLoss()
+        self.score_temp      = 0.5
+        self.hit1_margin     = 1.0
 
         self.w = nn.Parameter(
             torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.d_model)).float(),
@@ -208,6 +215,16 @@ class MatchingFlowTKG(nn.Module):
             x2 = x2 + dt * self.vector_field2(x2, t_emb, context_img)
         return x1, x2
 
+    def _rank_scores(self, context_real, context_img, x_hat1, x_hat2, ent_real, ent_img):
+        """Score candidates with (context ⊙ x_hat) · entity. x_hat changes rank order."""
+        qx_r = self.dropout(context_real * x_hat1)
+        qx_i = self.dropout(context_img * x_hat2)
+        if ent_real.dim() == 2:
+            return qx_r.mm(ent_real.t()) + qx_i.mm(ent_img.t())
+        return (qx_r.unsqueeze(1) * ent_real).sum(dim=-1) + (
+            qx_i.unsqueeze(1) * ent_img
+        ).sum(dim=-1)
+
     # -----------------------------------------------------------------------
 
     def train_forward(self, heads, rels, tails, year, month, day, neg):
@@ -251,15 +268,8 @@ class MatchingFlowTKG(nn.Module):
         ent_embs1 = torch.cat([tail_real.unsqueeze(1), neg_real], dim=1)
         ent_embs2 = torch.cat([tail_img.unsqueeze(1),  neg_img],  dim=1)
 
-        type_intes = (
-            self.dropout(
-                context_real.multiply(x_hat1).unsqueeze(1)
-              - context_real.unsqueeze(1).multiply(ent_embs1)
-            ).sum(dim=-1)
-          + self.dropout(
-                context_img.multiply(x_hat2).unsqueeze(1)
-              - context_img.unsqueeze(1).multiply(ent_embs2)
-            ).sum(dim=-1)
+        type_intes = self._rank_scores(
+            context_real, context_img, x_hat1, x_hat2, ent_embs1, ent_embs2
         )
 
         labels = torch.cat([
@@ -267,13 +277,19 @@ class MatchingFlowTKG(nn.Module):
             torch.zeros(bs, neg.size(1), device=device),
         ], dim=1)
 
-        lp_loss     = self.lp_loss_fn(type_intes, torch.zeros(bs, dtype=torch.long, device=device))
+        lp_loss     = self.lp_loss_fn(
+            type_intes / self.score_temp,
+            torch.zeros(bs, dtype=torch.long, device=device),
+        )
+        hard_neg    = type_intes[:, 1:].max(dim=1).values
+        hit1_loss   = F.relu(hard_neg - type_intes[:, 0] + self.hit1_margin).mean()
         contra_loss = _contrastive_loss(type_intes, labels)
         reg_loss    = self.emb_regularizer((head_real, head_img, rel_real, rel_img))
         w_smooth    = ((self.w[1:] - self.w[:-1]) ** 2).mean()
 
         return (lp_loss
-                + 5.0 * contra_loss
+                + 2.0 * hit1_loss
+                + 1.0 * contra_loss
                 + 1.0 * fm_loss
                 + 5.0 * reg_loss
                 + 0.01 * w_smooth)
@@ -293,11 +309,6 @@ class MatchingFlowTKG(nn.Module):
         all_real = self.encoder1.get_all_ent_embedding()
         all_img  = self.encoder2.get_all_ent_embedding()
 
-        scores = F.softplus(
-            self.dropout(context_real.multiply(x_hat1)).sum(dim=-1, keepdim=True)
-          - context_real.mm(all_real.t())
-          + self.dropout(context_img.multiply(x_hat2)).sum(dim=-1, keepdim=True)
-          - context_img.mm(all_img.t())
+        return self._rank_scores(
+            context_real, context_img, x_hat1, x_hat2, all_real, all_img
         )
-
-        return scores
