@@ -41,6 +41,10 @@ def parse_args(args=None):
     parser.add_argument('--do_test', action='store_true')
     parser.add_argument('--valid_epoch', default=3, type=int)
     parser.add_argument('--dropout', default=0.1, type=float)
+    parser.add_argument(
+        '--ode_steps', default=1, type=int,
+        help='MatchingFlow Euler steps at test (1 is fastest; 4–8 can raise MRR)',
+    )
 
     parser.add_argument('--load_model_path', default='output1', type=str)
 
@@ -221,7 +225,11 @@ def main(args):
                     s_emb_dim = 64,t_emb_dim = 36)
     if args.model_name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown model '{args.model_name}'. Valid: {list(MODEL_REGISTRY.keys())}")
-    model = MODEL_REGISTRY[args.model_name](config)
+    model_cls = MODEL_REGISTRY[args.model_name]
+    if args.model_name == 'MatchingFlow':
+        model = model_cls(config, ode_steps=args.ode_steps)
+    else:
+        model = model_cls(config)
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

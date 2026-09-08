@@ -138,6 +138,27 @@ def test_ode_steps_zero_raises_value_error(small_config):
         model_zero.test_forward(heads, rels, tails, year, month, day)
 
 
+def test_one_step_test_forward_shape(small_config):
+    """Default 1-step Euler returns (bs, n_ent)."""
+    model = MatchingFlowTKG(small_config, ode_steps=1)
+    model.eval()
+    heads, rels, tails, year, month, day = make_batch(small_config, bs=3)
+    with torch.no_grad():
+        scores = model.test_forward(heads, rels, tails, year, month, day)
+    assert scores.shape == (3, small_config.n_ent)
+
+
+def test_train_forward_one_step_finite(small_config):
+    """1-step training path returns a finite scalar."""
+    model = MatchingFlowTKG(small_config, ode_steps=1)
+    model.train()
+    heads, rels, tails, year, month, day = make_batch(small_config, bs=2)
+    neg = torch.randint(0, small_config.n_ent, (2, 8))
+    loss = model.train_forward(heads, rels, tails, year, month, day, neg)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+
+
 # ---------------------------------------------------------------------------
 # Test 6: Unknown model_name raises ValueError listing valid names
 # ---------------------------------------------------------------------------
