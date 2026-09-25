@@ -84,6 +84,28 @@ def load_pretrained_tables(data_dir, num_e, num_r, model_name=DEFAULT_EMB_MODEL,
     return torch.cat([ent, pad], dim=0), torch.cat([rel_fwd, rel_inv], dim=0)
 
 
+def pca_reduce_tables(ent, rel, d_out):
+    """Project stacked entity/relation vectors to ``d_out`` with PCA (SVD).
+
+    The PAD row (last entity) stays zeros. ``d_model`` can stay 100 while Qwen
+    is 1024; this is a fixed reduction, not a learned Linear.
+    """
+    d_in = ent.size(1)
+    if d_out == d_in:
+        return ent, rel
+    if d_out > d_in:
+        raise ValueError('d_model={} is larger than pretrained dim {}'.format(d_out, d_in))
+    body = torch.cat([ent[:-1], rel], dim=0)
+    mean = body.mean(dim=0, keepdim=True)
+    centered = body - mean
+    _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+    reduced = F.normalize(centered.matmul(vh[:d_out].T), p=2, dim=-1)
+    n_body_ent = ent.size(0) - 1
+    ent_reduced = torch.cat([reduced[:n_body_ent], torch.zeros(1, d_out, dtype=ent.dtype)], dim=0)
+    rel_reduced = reduced[n_body_ent:]
+    return ent_reduced, rel_reduced
+
+
 def load_names(path, count):
     names = ['id {}'.format(i) for i in range(count)]
     if not os.path.isfile(path):

@@ -27,16 +27,219 @@ def _dgl_graph(src, dst, num_nodes):
 
 def _dgl_subgraph(g, nodes):
     try:
-        return g.subgraph(list(nodes), store_ids=False)
+        sub = g.subgraph(list(nodes), store_ids=False)
     except TypeError:
-        return g.subgraph(list(nodes))
+        sub = g.subgraph(list(nodes))
+    return _copy_induced_features(g, sub)
 
 
 def _dgl_edge_subgraph(g, eids):
+    if torch.is_tensor(eids) and eids.dtype == torch.bool:
+        eids = eids.nonzero().view(-1)
+    eids = _as_long_1d(eids)
+    edge_subgraph = getattr(dgl, 'edge_subgraph', None)
+    if callable(edge_subgraph):
+        try:
+            sub = edge_subgraph(g, eids, store_ids=False)
+        except TypeError:
+            sub = edge_subgraph(g, eids)
+        return _copy_induced_features(g, sub)
+    method = getattr(g, 'edge_subgraph', None)
+    if callable(method):
+        try:
+            sub = method(eids, store_ids=False)
+        except TypeError:
+            sub = method(eids)
+        return _copy_induced_features(g, sub)
+    return _manual_edge_subgraph(g, eids)
+
+
+def _manual_edge_subgraph(g, eids):
+    """Keep only ``eids`` on DGL 0.x, which has no ``dgl.edge_subgraph``."""
+    src, dst = g.edges()
+    src = _as_long_1d(src)
+    dst = _as_long_1d(dst)
+    if eids is None or eids.numel() == 0:
+        sub = _dgl_graph(np.array([]), np.array([]), num_nodes=1)
+        sub.ndata['id'] = torch.tensor([[-1]], dtype=torch.long)
+        empty = torch.zeros(0, dtype=torch.long)
+        for key in ('type', 'timestamp', 'query_rel', 'query_ent'):
+            sub.edata[key] = empty
+        return sub
+
+    src_k = src[eids]
+    dst_k = dst[eids]
+    nodes = torch.unique(torch.cat([src_k, dst_k], dim=0))
+    remap = {int(old): new for new, old in enumerate(nodes.tolist())}
+    new_src = np.array([remap[int(x)] for x in src_k.tolist()], dtype=np.int64)
+    new_dst = np.array([remap[int(x)] for x in dst_k.tolist()], dtype=np.int64)
+    sub = _dgl_graph(new_src, new_dst, num_nodes=int(nodes.numel()))
+    if _has_ndata(g, 'id'):
+        ids = g.ndata['id']
+        if ids.dim() > 1:
+            ids = ids.squeeze(-1)
+        sub.ndata['id'] = ids[nodes].view(-1, 1)
+    else:
+        sub.ndata['id'] = nodes.view(-1, 1)
+    for key in ('type', 'timestamp', 'query_rel', 'query_ent'):
+        if _has_edata(g, key):
+            sub.edata[key] = g.edata[key][eids]
+        else:
+            sub.edata[key] = torch.zeros(eids.numel(), dtype=torch.long)
+    return sub
+
+
+def _as_long_1d(value):
+    if value is None:
+        return None
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value)
+    return value.long().reshape(-1)
+
+
+def _parent_nids(sub):
+    for name in ('parent_nid', '_parent_nid'):
+        if hasattr(sub, name):
+            ids = _as_long_1d(getattr(sub, name))
+            if ids is not None and ids.numel() == _num_nodes(sub):
+                return ids
     try:
-        return dgl.edge_subgraph(g, eids, store_ids=False)
-    except TypeError:
-        return dgl.edge_subgraph(g, eids)
+        if '_ID' in sub.ndata:
+            return _as_long_1d(sub.ndata['_ID'])
+    except (KeyError, TypeError):
+        pass
+    return None
+
+
+def _parent_eids(sub):
+    for name in ('parent_eid', '_parent_eid'):
+        if hasattr(sub, name):
+            ids = _as_long_1d(getattr(sub, name))
+            if ids is not None and ids.numel() == _num_edges(sub):
+                return ids
+    try:
+        if '_ID' in sub.edata:
+            return _as_long_1d(sub.edata['_ID'])
+    except (KeyError, TypeError):
+        pass
+    return None
+
+
+def _has_edata(g, key):
+    try:
+        g.edata[key]
+        return True
+    except (KeyError, TypeError):
+        return False
+
+
+def _has_ndata(g, key):
+    try:
+        g.ndata[key]
+        return True
+    except (KeyError, TypeError):
+        return False
+
+
+def _copy_induced_features(parent, sub):
+    """Old DGL subgraphs do not copy ndata/edata; pull them via parent ids."""
+    nids = _parent_nids(sub)
+    eids = _parent_eids(sub)
+    if not _has_ndata(sub, 'id') and _has_ndata(parent, 'id') and nids is not None:
+        sub.ndata['id'] = parent.ndata['id'][nids]
+    n_e = _num_edges(sub)
+    for key in ('type', 'timestamp', 'query_rel', 'query_ent'):
+        if _has_edata(sub, key):
+            continue
+        if _has_edata(parent, key) and eids is not None and eids.numel() == n_e and n_e > 0:
+            sub.edata[key] = parent.edata[key][eids]
+        else:
+            sub.edata[key] = torch.zeros(n_e, dtype=torch.long)
+    return sub
+
+
+def _empty_rel_graph(root_node):
+    g = dgl.DGLGraph()
+    g.add_nodes(1, {'id': torch.tensor([[root_node]], dtype=torch.long)})
+    empty = torch.zeros(0, dtype=torch.long)
+    for key in ('type', 'query_rel', 'query_ent'):
+        g.edata[key] = empty
+    return g
+
+
+def _pad_graph_nodes(g, n_nodes, pad_entity):
+    """Clone ``g`` into a mutable graph with ``n_nodes`` (DGL subgraphs are readonly)."""
+    src, dst = g.edges()
+    src = _as_long_1d(src)
+    dst = _as_long_1d(dst)
+    n_old = _num_nodes(g)
+    extra = max(int(n_nodes) - n_old, 0)
+    new_g = _dgl_graph(
+        src.cpu().numpy() if src.numel() else np.array([], dtype=np.int64),
+        dst.cpu().numpy() if dst.numel() else np.array([], dtype=np.int64),
+        num_nodes=n_old + extra,
+    )
+    if _has_ndata(g, 'id'):
+        ids = g.ndata['id']
+        if ids.dim() == 1:
+            ids = ids.view(-1, 1)
+        ids = ids.long().cpu()
+    else:
+        ids = torch.arange(n_old, dtype=torch.long).view(-1, 1)
+    if extra > 0:
+        ids = torch.cat([ids, torch.full((extra, 1), int(pad_entity), dtype=torch.long)], dim=0)
+    new_g.ndata['id'] = ids
+    n_e = int(src.numel())
+    for key in ('type', 'timestamp', 'query_rel', 'query_ent'):
+        if _has_edata(g, key):
+            new_g.edata[key] = g.edata[key]
+        else:
+            new_g.edata[key] = torch.zeros(n_e, dtype=torch.long)
+    return new_g
+
+
+def _num_edges(g):
+    if hasattr(g, 'num_edges') and callable(getattr(g, 'num_edges')):
+        return g.num_edges()
+    return g.number_of_edges()
+
+
+def _num_nodes(g):
+    if hasattr(g, 'num_nodes') and callable(getattr(g, 'num_nodes')):
+        return g.num_nodes()
+    return g.number_of_nodes()
+
+
+def _batch_num_nodes(g):
+    attr = getattr(g, 'batch_num_nodes', None)
+    if callable(attr):
+        return attr()
+    if attr is not None:
+        return torch.as_tensor(attr)
+    return torch.tensor([_num_nodes(g)])
+
+
+def graph_to_device(g, device):
+    """Move a DGL graph (including old BatchedDGLGraph) onto ``device``."""
+    to_fn = getattr(g, 'to', None)
+    if callable(to_fn):
+        try:
+            return to_fn(device, non_blocking=True)
+        except TypeError:
+            return to_fn(device)
+    for frame_name in ('ndata', 'edata'):
+        frame = getattr(g, frame_name, None)
+        if frame is None:
+            continue
+        try:
+            keys = list(frame.keys())
+        except Exception:
+            continue
+        for key in keys:
+            val = frame[key]
+            if torch.is_tensor(val):
+                frame[key] = val.to(device, non_blocking=True)
+    return g
 
 class BaseDataset(object):
     def __init__(self, trainpath, testpath, statpath, validpath):
@@ -241,19 +444,20 @@ class DGLGraphDataset(object):
         return sub_g
 
     def edge_samples(self, root_node, sub_g, conf):
-        if sub_g.num_edges() <= 1:
+        if _num_edges(sub_g) <= 1:
+            return sub_g
+        if not _has_edata(sub_g, 'type'):
             return sub_g
         edge_type = sub_g.edata['type']
         edge_conf = conf[edge_type]
         chosen = edge_conf > 0.1
         sub_g = _dgl_edge_subgraph(sub_g, chosen)
-        if root_node in sub_g.ndata['id'].squeeze(1).tolist():
+        node_ids = sub_g.ndata['id']
+        if node_ids.dim() > 1:
+            node_ids = node_ids.squeeze(1)
+        if root_node in node_ids.tolist():
             return sub_g
-        else:
-            g = dgl.DGLGraph()
-            g.add_nodes(1, {'id': torch.tensor([root_node]).view(-1, 1)})
-            g.edata['type'] = torch.LongTensor(np.array([]))
-            return g
+        return _empty_rel_graph(root_node)
 
     def comp_deg_norm(self, g):
         in_deg = g.in_degrees(range(g.number_of_nodes())).float()
@@ -380,13 +584,17 @@ class QuadruplesDataset(Dataset):
             if self.edge_sample:
                 sub_graph = self.dglGraphs.edge_samples(head_entity, sub_graph, self.edges_conf[relation])
 
-            sub_graph.edata['query_rel'] = torch.ones_like(sub_graph.edata['type']) * relation
-            sub_graph.edata['query_ent'] = torch.ones_like(sub_graph.edata['type']) * head_entity
-            # sub_graph.edata['query_time'] = torch.ones_like(sub_graph.edata['type']) * timestamp
+            n_e = _num_edges(sub_graph)
+            if not _has_edata(sub_graph, 'type'):
+                sub_graph.edata['type'] = torch.zeros(n_e, dtype=torch.long)
+            sub_graph.edata['query_rel'] = torch.full((n_e,), int(relation), dtype=torch.long)
+            sub_graph.edata['query_ent'] = torch.full((n_e,), int(head_entity), dtype=torch.long)
             history_graphs.append(sub_graph)
-            #history_rel_graphs.append(sub_rel_graph)
-            head_entity_ids.append(sub_graph.ndata['id'].squeeze(1).tolist().index(head_entity))
-            graphs_node_num.append(sub_graph.num_nodes())
+            node_ids = sub_graph.ndata['id']
+            if node_ids.dim() > 1:
+                node_ids = node_ids.squeeze(1)
+            head_entity_ids.append(node_ids.tolist().index(head_entity))
+            graphs_node_num.append(_num_nodes(sub_graph))
 
         #static_rel_graph = dgl.merge(history_rel_graphs)
         #relation_ids = static_rel_graph.ndata['id'].squeeze(1).tolist().index(relation)
@@ -448,20 +656,17 @@ class QuadruplesDataset(Dataset):
                 hts.extend(PAD_HT)
                 heids.extend(PAD_EID)
 
+            padded = []
             for g in hgs:
-                node_num = g.num_nodes()
-                if node_num < max_nodes_num:
-                    g.add_nodes(max_nodes_num - node_num,
-                                     {'id': torch.ones(max_nodes_num - node_num, 1).long() * pad_entity})
+                padded.append(_pad_graph_nodes(g, max_nodes_num, pad_entity))
 
-
-            pad_history_graphs.extend(hgs)
+            pad_history_graphs.extend(padded)
             pad_history_times.append(hts)
             pad_history_eids.extend(heids)
 
         pad_history_graphs = dgl.batch(pad_history_graphs)
         batch_node_ids = torch.tensor(pad_history_eids)
-        batchgraph_nodes_num = pad_history_graphs.batch_num_nodes()
+        batchgraph_nodes_num = _batch_num_nodes(pad_history_graphs)
         graph_num = batchgraph_nodes_num.size(0)
         offset_node_ids = batchgraph_nodes_num.unsqueeze(0).repeat(graph_num, 1)
         offset_mask = torch.tril(torch.ones(graph_num, graph_num), diagonal=-1).long()

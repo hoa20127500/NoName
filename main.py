@@ -4,13 +4,13 @@ import torch
 import os
 from tqdm import tqdm
 from dataset import *
-from embeddings import load_pretrained_tables
+from embeddings import load_pretrained_tables, pca_reduce_tables
 from model import TemporalTransformerHawkesGraphModel
 import logging
 from collections import namedtuple
 from torch.utils.data import DataLoader
 from utils import set_logger
-import pickle
+from onehop_conf import load_or_build_conf
 import math
 
 def parse_args(args=None):
@@ -22,14 +22,18 @@ def parse_args(args=None):
     parser.add_argument('--data_root', type=str, default='data')
     parser.add_argument('--output_root', type=str, default='output')
     parser.add_argument('--model_name', type=str, default='GHT')
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=64)
 
-    parser.add_argument('--num_works', type=int, default=8)
+    parser.add_argument('--num_works', type=int, default=0,
+                        help='DataLoader workers. 0 is required on Colab (each worker copies the full TKG).')
 
     parser.add_argument('--grad_norm', type=float, default=1.0)
     parser.add_argument('--weight_decay', type=float, default=0.00001)
 
-    parser.add_argument('--d_model', default=100, type=int)
+    parser.add_argument('--d_model', default=100, type=int,
+                        help='GHT hidden size. Qwen embeddings are 1024-d; they are reduced to this.')
+    parser.add_argument('--emb_reduce', default='pca', choices=['pca', 'linear'],
+                        help='pca: SVD 1024->d_model then freeze. linear: keep 1024-d tables and train Linear(1024, d_model).')
     parser.add_argument('--data', default='ICEWS14', type=str)
     parser.add_argument('--max_epochs', default=30, type=int)
     parser.add_argument('--lr', default=0.003, type=float)
@@ -71,6 +75,19 @@ def parse_args(args=None):
 
     return parser.parse_args(args)
 
+def _make_loader(dataset, batch_size, num_workers, shuffle, pad_entity):
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=lambda x: dataset.collate_fn(x, pad_entity),
+        num_workers=num_workers,
+        pin_memory=False,
+    )
+    if num_workers > 0:
+        kwargs['persistent_workers'] = False
+    return DataLoader(**kwargs)
+
 def test(model, testloader, skip_dict, device):
     model.eval()
     ranks = []
@@ -83,7 +100,7 @@ def test(model, testloader, skip_dict, device):
             rel = rel.to(device, non_blocking=True)
             obj = obj.to(device, non_blocking=True)
             time = time.to(device, non_blocking=True)
-            history_graphs = history_graphs.to(device, non_blocking=True)
+            history_graphs = graph_to_device(history_graphs, device)
             history_times = history_times.to(device, non_blocking=True)
             batch_node_ids = batch_node_ids.to(device, non_blocking=True)
 
@@ -150,7 +167,7 @@ def train_epoch(args, model, traindataloader, optimizer, scheduler, device, epoc
             rel = rel.to(device, non_blocking=True)
             obj = obj.to(device, non_blocking=True)
             time = time.to(device, non_blocking=True)
-            history_graphs = history_graphs.to(device, non_blocking=True)
+            history_graphs = graph_to_device(history_graphs, device)
             history_times = history_times.to(device, non_blocking=True)
             batch_node_ids = batch_node_ids.to(device, non_blocking=True)
 
@@ -206,52 +223,36 @@ def main(args):
         baseDataset.train_snapshots + baseDataset.valid_snapshots + baseDataset.test_snapshots,
         baseDataset.num_e, baseDataset.num_r)
 
+    trainQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
     if args.edge_sample == 'one_hop_conf':
-        edges_conf = pickle.load(open(os.path.join(data_path, 'conf.pkl'), 'rb'))
-        edges_conf = torch.tensor(edges_conf)
+        logging.info('Loading one-hop relation confidence from {}'.format(
+            os.path.join(data_path, 'conf.pkl')))
+        edges_conf = torch.tensor(load_or_build_conf(
+            data_path, trainQuadruples, baseDataset.num_r))
         edge_sample = True
     else:
         edges_conf = None
         edge_sample = False
-    trainQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.trainQuadruples, baseDataset.num_r)
     trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, dglGraphDataset, baseDataset,
                                          args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
                                          edges_conf, edge_sample, 'train')
-    trainDataLoader = DataLoader(
-        trainQuadDataset,
-        shuffle=True,
-        batch_size=args.batch_size,
-        collate_fn=lambda x: trainQuadDataset.collate_fn(x, baseDataset.num_e),
-        num_workers=args.num_works,
-        pin_memory=True
-    )
+    trainDataLoader = _make_loader(
+        trainQuadDataset, args.batch_size, args.num_works, True, baseDataset.num_e)
 
 
     validQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.validQuadruples, baseDataset.num_r)
     validQuadDataset = QuadruplesDataset(validQuadruples, args.history_len, dglGraphDataset, baseDataset,
                                         args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
                                         edges_conf, edge_sample, 'test')
-    validDataLoader = DataLoader(
-        validQuadDataset,
-        shuffle=False,
-        batch_size=args.batch_size,
-        collate_fn=lambda x: validQuadDataset.collate_fn(x, baseDataset.num_e),
-        num_workers=args.num_works,
-        pin_memory=True
-    )
+    validDataLoader = _make_loader(
+        validQuadDataset, args.batch_size, args.num_works, False, baseDataset.num_e)
 
     testQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.testQuadruples, baseDataset.num_r)
     testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, dglGraphDataset, baseDataset,
                                         args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
                                         edges_conf, edge_sample, 'test')
-    testDataLoader = DataLoader(
-        testQuadDataset,
-        shuffle=False,
-        batch_size=args.batch_size,
-        collate_fn=lambda x: testQuadDataset.collate_fn(x, baseDataset.num_e),
-        num_workers=args.num_works,
-        pin_memory=True
-    )
+    testDataLoader = _make_loader(
+        testQuadDataset, args.batch_size, args.num_works, False, baseDataset.num_e)
 
     Config = namedtuple('config', ['n_ent', 'd_model', 'n_rel', 'dropout','seqTransformerLayerNum', 'seqTransformerHeadNum'])
     config = Config(n_ent=baseDataset.num_e + 1,
@@ -273,6 +274,11 @@ def main(args):
         )
         logging.info('Pretrained embeddings ent={} rel={} freeze={}'.format(
             tuple(ent_pretrained.shape), tuple(rel_pretrained.shape), freeze_pretrained))
+        if args.emb_reduce == 'pca' and ent_pretrained.size(1) != args.d_model:
+            logging.info('PCA-reducing pretrained dim {} -> d_model {}'.format(
+                ent_pretrained.size(1), args.d_model))
+            ent_pretrained, rel_pretrained = pca_reduce_tables(
+                ent_pretrained, rel_pretrained, args.d_model)
 
     model = TemporalTransformerHawkesGraphModel(
         config, args.eps, args.time_span, args.timestep, args.hmax,
