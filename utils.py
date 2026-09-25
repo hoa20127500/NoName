@@ -1,4 +1,5 @@
 import logging
+import torch
 
 
 def set_logger(log_file):
@@ -49,3 +50,14 @@ class ScheduledOptim():
 
         for param_group in self._optimizer.param_groups:
             param_group['lr'] = lr
+
+
+def scatter_mean(src, index, dim=-1):
+    """Mean-reduce ``src`` along ``dim`` by ``index``. Replaces torch_scatter."""
+    if index.numel() == 0:
+        return src
+    dim_size = int(index.max().item()) + 1
+    out_size = list(src.shape)
+    out_size[dim] = dim_size
+    out = src.new_zeros(out_size)
+    return out.scatter_reduce(dim, index, src, reduce='mean', include_self=False)

@@ -5,9 +5,9 @@ import torch.nn.functional as F
 import numpy as np
 from models.GraphEncoder import RGTEncoder, RGCNEncoder
 from models.SequenceEncoder import TransformerEncoder
-import torch_scatter
 from models.ConvTransE import ConvTransE
 from embeddings import ProjectedEmbedding
+from utils import scatter_mean
 
 class LabelSmoothingCrossEntropy(nn.Module):
     def __init__(self, eps=0.1, reduction='mean'):
@@ -137,7 +137,7 @@ class TemporalTransformerHawkesGraphModel(nn.Module):
 
 
     def link_prediction_loss(self, intens, type, answers):
-        intens = torch_scatter.scatter(intens, type, dim=-1, reduce="mean")
+        intens = scatter_mean(intens, type, dim=-1)
         loss = self.lp_loss_fn(intens[:, :-1], answers)
         return loss
 
@@ -148,7 +148,7 @@ class TemporalTransformerHawkesGraphModel(nn.Module):
     def ents_score(self, intens, type, local_weight=1.):
         #intens = F.softmax(intens, dim=-1)
         #intens[:, self.n_ent:] = intens[:, self.n_ent:] * 0.65
-        output = torch_scatter.scatter(intens, type, dim=-1, reduce="mean")
+        output = scatter_mean(intens, type, dim=-1)
         return output[:, :-1]
 
     def predict_t(self, tail_ent, dur_last, query_ent_embeds, query_rel_embeds, history_gh, history_times, history_pad_mask,statics_ent_embeds):
