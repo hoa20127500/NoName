@@ -4,7 +4,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import dgl.function as fn
+from utils import scatter_softmax, scatter_sum
+
 
 class RGTLayer(nn.Module):
     def __init__(self, d_model, n_head=1, drop=0.1):
@@ -57,6 +58,24 @@ class RGTLayer(nn.Module):
         g.update_all(self.msg_func, self.reduce_func)
         return g
 
+    def forward_flat(self, h, src, dst, e_h, qrh, qeh):
+        """Batched RGT on a disconnected graph: h [N, d], src/dst [E]."""
+        if src.numel() == 0:
+            return h
+        h_src = h[src]
+        h_dst = h[dst]
+        msg = F.leaky_relu(self.dropout(self.msg_fc(torch.cat([h_src, h_dst], dim=-1)) * e_h))
+        q = self.qw(torch.cat([qrh, qeh], dim=-1)) / self.temp
+        k = self.kw(torch.cat([h_src, e_h], dim=-1))
+        msg = msg.view(-1, self.n_head, self.d_model)
+        q = q.view(-1, self.n_head, self.d_model)
+        k = k.view(-1, self.n_head, self.d_model)
+        att = torch.sum(q * k, dim=-1, keepdim=True)
+        alpha = self.dropout(scatter_softmax(att, dst, h.size(0)))
+        agg = scatter_sum(alpha * msg, dst, h.size(0)).view(-1, self.n_head * self.d_model)
+        out = self.dropout(F.gelu(self.output_fc(agg)))
+        return self.layer_norm1(out + h)
+
 class RGTEncoder(nn.Module):
     def __init__(self, d_model, drop=0.1, n_head=1):
         super(RGTEncoder, self).__init__()
@@ -68,9 +87,12 @@ class RGTEncoder(nn.Module):
     def forward(self, g):
         self.layer1(g)
         self.layer2(g)
-        # self.layer3(g)
-        # self.layer4(g)
         return g.ndata['h']
+
+    def forward_flat(self, h, src, dst, e_h, qrh, qeh):
+        h = self.layer1.forward_flat(h, src, dst, e_h, qrh, qeh)
+        h = self.layer2.forward_flat(h, src, dst, e_h, qrh, qeh)
+        return h
 
 
 class RGCNLayer(nn.Module):

@@ -22,7 +22,7 @@ def parse_args(args=None):
     parser.add_argument('--data_root', type=str, default='data')
     parser.add_argument('--output_root', type=str, default='output')
     parser.add_argument('--model_name', type=str, default='GHT')
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=256)
 
     parser.add_argument('--num_works', type=int, default=0,
                         help='DataLoader workers. 0 is required on Colab (each worker copies the full TKG).')
@@ -39,7 +39,7 @@ def parse_args(args=None):
     parser.add_argument('--lr', default=0.003, type=float)
     parser.add_argument('--do_train', action='store_true')
     parser.add_argument('--do_test', action='store_true')
-    parser.add_argument('--valid_epoch', default=1, type=int)
+    parser.add_argument('--valid_epoch', default=5, type=int)
     parser.add_argument('--history_len', default=10, type=int)
     parser.add_argument('--dropout', default=0.5, type=float)
 

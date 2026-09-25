@@ -61,3 +61,24 @@ def scatter_mean(src, index, dim=-1):
     out_size[dim] = dim_size
     out = src.new_zeros(out_size)
     return out.scatter_reduce(dim, index, src, reduce='mean', include_self=False)
+
+
+def scatter_sum(src, index, dim_size):
+    if src.numel() == 0:
+        return src.new_zeros((dim_size,) + src.shape[1:])
+    out = src.new_zeros((dim_size,) + src.shape[1:])
+    idx = index.view(-1, *([1] * (src.dim() - 1))).expand_as(src)
+    return out.scatter_add(0, idx, src)
+
+
+def scatter_softmax(src, index, dim_size):
+    if src.numel() == 0:
+        return src
+    idx = index.view(-1, *([1] * (src.dim() - 1))).expand_as(src)
+    maxes = src.new_full((dim_size,) + src.shape[1:], float('-inf'))
+    maxes = maxes.scatter_reduce(0, idx, src, reduce='amax', include_self=True)
+    maxes = torch.where(torch.isfinite(maxes), maxes, torch.zeros_like(maxes))
+    src = src - maxes[index]
+    exp = src.exp()
+    den = scatter_sum(exp, index, dim_size).clamp_min(1e-9)
+    return exp / den[index]

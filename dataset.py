@@ -379,6 +379,88 @@ class BaseDataset(object):
         r_triples = set()
         return list(r_triples)
 
+class SnapshotIndex(object):
+    """Per-timestamp edge list + in-neighbor CSR. Avoids DGL subgraph on 0.1.3."""
+
+    def __init__(self, src, dst, rel, n_ent):
+        self.src = np.asarray(src, dtype=np.int64)
+        self.dst = np.asarray(dst, dtype=np.int64)
+        self.rel = np.asarray(rel, dtype=np.int64)
+        self.n_ent = int(n_ent)
+        if self.src.size == 0:
+            self._src_by_dst = self.src
+            self._in_ptr = np.zeros(self.n_ent + 1, dtype=np.int64)
+            return
+        order = np.argsort(self.dst, kind='mergesort')
+        self._src_by_dst = self.src[order]
+        counts = np.bincount(self.dst, minlength=self.n_ent)
+        self._in_ptr = np.zeros(self.n_ent + 1, dtype=np.int64)
+        np.cumsum(counts, out=self._in_ptr[1:])
+
+    def in_neighbors(self, node):
+        node = int(node)
+        if node < 0 or node >= self.n_ent:
+            return self._src_by_dst[:0]
+        return self._src_by_dst[self._in_ptr[node]:self._in_ptr[node + 1]]
+
+    def collect_nodes(self, root, n_hop):
+        root = int(root)
+        keep = np.zeros(self.n_ent, dtype=bool)
+        keep[root] = True
+        frontier = np.array([root], dtype=np.int64)
+        for _ in range(max(int(n_hop), 0)):
+            if frontier.size == 0:
+                break
+            chunks = [self.in_neighbors(v) for v in frontier]
+            merged = np.concatenate(chunks) if chunks else frontier[:0]
+            if merged.size == 0:
+                break
+            merged = np.unique(merged)
+            new = merged[~keep[merged]]
+            keep[new] = True
+            frontier = new
+        return np.nonzero(keep)[0]
+
+    def make_graph(self, root, n_hop, conf_row=None):
+        root = int(root)
+        nodes = self.collect_nodes(root, n_hop)
+        if self.src.size == 0 or nodes.size == 0:
+            return _empty_rel_graph(root)
+        keep_node = np.zeros(self.n_ent, dtype=bool)
+        keep_node[nodes] = True
+        emask = keep_node[self.src] & keep_node[self.dst]
+        if conf_row is not None:
+            conf_np = conf_row.detach().cpu().numpy() if torch.is_tensor(conf_row) else np.asarray(conf_row)
+            emask = np.logical_and(emask, conf_np[self.rel] > 0.1)
+        src, dst, rel = self.src[emask], self.dst[emask], self.rel[emask]
+        if src.size == 0:
+            return _empty_rel_graph(root)
+        used = np.unique(np.concatenate([src, dst, np.array([root], dtype=np.int64)]))
+        if root not in used:
+            return _empty_rel_graph(root)
+        remap = np.full(self.n_ent, -1, dtype=np.int64)
+        remap[used] = np.arange(used.size, dtype=np.int64)
+        g = _dgl_graph(remap[src], remap[dst], num_nodes=int(used.size))
+        g.ndata['id'] = torch.from_numpy(np.ascontiguousarray(used)).view(-1, 1)
+        g.edata['type'] = torch.from_numpy(np.ascontiguousarray(rel))
+        return g
+
+
+def _bidirectional_edges(triples, num_rels):
+    if triples is None or np.asarray(triples).size == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, empty, empty
+    src, rel, dst = np.asarray(triples).transpose()
+    src = src.astype(np.int64, copy=False)
+    dst = dst.astype(np.int64, copy=False)
+    rel = rel.astype(np.int64, copy=False)
+    return (
+        np.concatenate((src, dst)),
+        np.concatenate((dst, src)),
+        np.concatenate((rel, rel + num_rels)),
+    )
+
+
 class DGLGraphDataset(object):
     def __init__(self, ent_snapshots, n_ent, n_rel):
         self.n_ent = n_ent
@@ -386,78 +468,23 @@ class DGLGraphDataset(object):
         self.n_hyper_rel = 4
         self.snapshots_num = len(ent_snapshots)
         self.snapshots = ent_snapshots
+        self.snapshots_index = {}
+        for triples, time in ent_snapshots:
+            src, dst, rel = _bidirectional_edges(triples, n_rel)
+            self.snapshots_index[int(time)] = SnapshotIndex(src, dst, rel, n_ent)
+        empty = np.array([], dtype=np.int64)
+        self.snapshots_index[-1] = SnapshotIndex(empty, empty, empty, n_ent)
+        self.dgl_rel_graphs = {}
 
-        #self.rel_triples = defaultdict(set)
-        #for r1, hyper_r, r2,t in rel_triples:
-          #self.rel_triples[t].add((r1,hyper_r,r2))
-
-
-        self.dgl_graph_dict, self.dgl_graphs, self.dgl_rel_graphs = self.get_dglGraph_dict(ent_snapshots)
-
-    def get_dglGraph_dict(self, snapshots):
-        dgl_graph_dict = {}
-        dgl_rels_dict = {}
-        dgl_graph = []
-        for (g, time) in snapshots:
-            graph = self.build_sub_graph(self.n_ent, self.n_rel, g, time)
-            dgl_graph_dict[time] = graph
-            dgl_graph.append(graph)
-            #rels_graph = self.get_relation_dglGraph( self.rel_triples[time], self.n_rel * 2 + 1, self.n_hyper_rel)
-            #dgl_rels_dict[time] = rels_graph
-        PAD_graph = self.build_sub_graph(self.n_ent, self.n_rel, np.array([]), 0)
-        dgl_graph_dict[-1] = PAD_graph
-        #PAD_rel_graph = self.get_relation_dglGraph(np.array([]), self.n_rel * 2 + 1, self.n_hyper_rel)
-
-        #dgl_rels_dict[-1] = PAD_rel_graph
-        dgl_graph.insert(0, PAD_graph)
-        return dgl_graph_dict, dgl_graph, dgl_rels_dict
-
-    def build_sub_graph(self, num_nodes, num_rels, triples, time):
-        if triples.size != 0:
-            src, rel, dst = triples.transpose()
-            src, dst = np.concatenate((src, dst)), np.concatenate((dst, src))
-            rel = np.concatenate((rel, rel + num_rels))
-        else:
-            src, rel, dst = np.array([]), np.array([]), np.array([])
-        g = _dgl_graph(src, dst, num_nodes)
-
-        node_id = torch.arange(0, num_nodes, dtype=torch.long).view(-1, 1)
-        g.ndata.update({'id': node_id})
-        g.edata['type'] = torch.LongTensor(rel)
-        g.edata['timestamp'] = torch.LongTensor(torch.ones_like(g.edata['type']) * time)
-        return g
+    def history_graph(self, time, root_node, n_hop, conf_row=None):
+        snap = self.snapshots_index.get(int(time), self.snapshots_index[-1])
+        return snap.make_graph(root_node, n_hop, conf_row)
 
     def get_nhop_subgraph(self, time, root_node, n=2):
-        g = self.dgl_graph_dict[time]
-        # g = dgl.in_subgraph(g, [root_node])
-        total_nodes = set()
-        total_nodes.add(root_node)
-        for i in range(n):
-            step_nodes = total_nodes.copy()
-            for node in step_nodes:
-                neighbor_n, _ = g.in_edges(node)
-                neighbor_n = set(neighbor_n.tolist())
-                total_nodes |= neighbor_n
-        sub_g = _dgl_subgraph(g, total_nodes)
-        # sub_g.ndata['norm'] = self.comp_deg_norm(sub_g).view(-1, 1)
-        # sub_g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
-        return sub_g
+        return self.history_graph(time, root_node, n)
 
     def edge_samples(self, root_node, sub_g, conf):
-        if _num_edges(sub_g) <= 1:
-            return sub_g
-        if not _has_edata(sub_g, 'type'):
-            return sub_g
-        edge_type = sub_g.edata['type']
-        edge_conf = conf[edge_type]
-        chosen = edge_conf > 0.1
-        sub_g = _dgl_edge_subgraph(sub_g, chosen)
-        node_ids = sub_g.ndata['id']
-        if node_ids.dim() > 1:
-            node_ids = node_ids.squeeze(1)
-        if root_node in node_ids.tolist():
-            return sub_g
-        return _empty_rel_graph(root_node)
+        return sub_g
 
     def comp_deg_norm(self, g):
         in_deg = g.in_degrees(range(g.number_of_nodes())).float()
@@ -576,14 +603,9 @@ class QuadruplesDataset(Dataset):
         history_graphs = []
         head_entity_ids = []
         graphs_node_num = []
-        history_rel_graphs = []
+        conf_row = self.edges_conf[relation] if self.edge_sample else None
         for i, t in enumerate(history_times):
-            sub_graph = self.dglGraphs.get_nhop_subgraph(t, head_entity, self.nhop)
-            #sub_rel_graph = self.dglGraphs.get_nhop_rel_subgraph(relation,time = t,n = self.nhop)
-
-            if self.edge_sample:
-                sub_graph = self.dglGraphs.edge_samples(head_entity, sub_graph, self.edges_conf[relation])
-
+            sub_graph = self.dglGraphs.history_graph(t, head_entity, self.nhop, conf_row)
             n_e = _num_edges(sub_graph)
             if not _has_edata(sub_graph, 'type'):
                 sub_graph.edata['type'] = torch.zeros(n_e, dtype=torch.long)
