@@ -6,6 +6,38 @@ import compat  # noqa: F401 — must run before dgl on Python 3.10+
 import dgl
 import torch
 
+
+def _dgl_graph(src, dst, num_nodes):
+    """Build a homogeneous graph on both old DGL (0.x) and current DGL (1.x/2.x).
+
+    On DGL 0.x ``dgl.graph`` is a *module*, not a constructor — calling it raises
+    ``TypeError: 'module' object is not callable``.
+    """
+    src = np.asarray(src)
+    dst = np.asarray(dst)
+    graph_fn = getattr(dgl, 'graph', None)
+    if callable(graph_fn):
+        return graph_fn((src, dst), num_nodes=int(num_nodes))
+    g = dgl.DGLGraph()
+    g.add_nodes(int(num_nodes))
+    if src.size:
+        g.add_edges(src, dst)
+    return g
+
+
+def _dgl_subgraph(g, nodes):
+    try:
+        return g.subgraph(list(nodes), store_ids=False)
+    except TypeError:
+        return g.subgraph(list(nodes))
+
+
+def _dgl_edge_subgraph(g, eids):
+    try:
+        return dgl.edge_subgraph(g, eids, store_ids=False)
+    except TypeError:
+        return dgl.edge_subgraph(g, eids)
+
 class BaseDataset(object):
     def __init__(self, trainpath, testpath, statpath, validpath):
         """base Dataset. Read data files and preprocess.
@@ -184,10 +216,7 @@ class DGLGraphDataset(object):
             rel = np.concatenate((rel, rel + num_rels))
         else:
             src, rel, dst = np.array([]), np.array([]), np.array([])
-        #g = dgl.DGLGraph()
-        g = dgl.graph((src, dst), num_nodes=num_nodes)
-        #g.add_nodes(num_nodes)
-        #g.add_edges(src, dst)
+        g = _dgl_graph(src, dst, num_nodes)
 
         node_id = torch.arange(0, num_nodes, dtype=torch.long).view(-1, 1)
         g.ndata.update({'id': node_id})
@@ -206,7 +235,7 @@ class DGLGraphDataset(object):
                 neighbor_n, _ = g.in_edges(node)
                 neighbor_n = set(neighbor_n.tolist())
                 total_nodes |= neighbor_n
-        sub_g = g.subgraph(list(total_nodes), store_ids=False)
+        sub_g = _dgl_subgraph(g, total_nodes)
         # sub_g.ndata['norm'] = self.comp_deg_norm(sub_g).view(-1, 1)
         # sub_g.apply_edges(lambda edges: {'norm': edges.dst['norm'] * edges.src['norm']})
         return sub_g
@@ -217,7 +246,7 @@ class DGLGraphDataset(object):
         edge_type = sub_g.edata['type']
         edge_conf = conf[edge_type]
         chosen = edge_conf > 0.1
-        sub_g = dgl.edge_subgraph(sub_g, chosen, store_ids=False)
+        sub_g = _dgl_edge_subgraph(sub_g, chosen)
         if root_node in sub_g.ndata['id'].squeeze(1).tolist():
             return sub_g
         else:
@@ -265,7 +294,7 @@ class DGLGraphDataset(object):
                   break
                 else:
                   total_nodes |= neighbor_n
-        sub_g = g.subgraph(list(total_nodes), store_ids=False)
+        sub_g = _dgl_subgraph(g, total_nodes)
         return sub_g
 
 class QuadruplesDataset(Dataset):
