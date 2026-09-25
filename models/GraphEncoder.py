@@ -1,5 +1,6 @@
 import compat  # noqa: F401 — must run before dgl on Python 3.10+
 import dgl
+import dgl.function as fn
 import math
 import torch
 import torch.nn as nn
@@ -64,7 +65,9 @@ class RGTLayer(nn.Module):
             return h
         h_src = h[src]
         h_dst = h[dst]
-        msg = F.leaky_relu(self.dropout(self.msg_fc(torch.cat([h_src, h_dst], dim=-1)) * e_h))
+        msg = self.msg_fc(torch.cat([h_src, h_dst], dim=-1))
+        msg = torch.multiply(msg, e_h)
+        msg = self.dropout(F.leaky_relu(msg))
         q = self.qw(torch.cat([qrh, qeh], dim=-1)) / self.temp
         k = self.kw(torch.cat([h_src, e_h], dim=-1))
         msg = msg.view(-1, self.n_head, self.d_model)
@@ -74,7 +77,10 @@ class RGTLayer(nn.Module):
         alpha = self.dropout(scatter_softmax(att, dst, h.size(0)))
         agg = scatter_sum(alpha * msg, dst, h.size(0)).view(-1, self.n_head * self.d_model)
         out = self.dropout(F.gelu(self.output_fc(agg)))
-        return self.layer_norm1(out + h)
+        updated = self.layer_norm1(out + h)
+        has_in = torch.zeros(h.size(0), dtype=torch.bool, device=h.device)
+        has_in[dst] = True
+        return torch.where(has_in.unsqueeze(-1), updated, h)
 
 class RGTEncoder(nn.Module):
     def __init__(self, d_model, drop=0.1, n_head=1):

@@ -88,6 +88,10 @@ def _make_loader(dataset, batch_size, num_workers, shuffle, pad_entity):
         kwargs['persistent_workers'] = False
     return DataLoader(**kwargs)
 
+def _batch_to_device(batch, device):
+    return tuple(x.to(device, non_blocking=True) for x in batch)
+
+
 def test(model, testloader, skip_dict, device):
     model.eval()
     ranks = []
@@ -95,17 +99,13 @@ def test(model, testloader, skip_dict, device):
     TimeMSE = 0.
     TimeMAE = 0.
     with torch.no_grad():
-        for sub, rel, obj, time, history_graphs, history_times, batch_node_ids in tqdm(testloader):
-            sub = sub.to(device, non_blocking=True)
-            rel = rel.to(device, non_blocking=True)
-            obj = obj.to(device, non_blocking=True)
-            time = time.to(device, non_blocking=True)
-            history_graphs = graph_to_device(history_graphs, device)
-            history_times = history_times.to(device, non_blocking=True)
-            batch_node_ids = batch_node_ids.to(device, non_blocking=True)
+        for batch in tqdm(testloader):
+            sub, rel, obj, time, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, history_times = \
+                _batch_to_device(batch, device)
 
-            scores, estimate_dt, dur_last = model.test_forward(sub, rel, obj, time, history_graphs, history_times, batch_node_ids,
-                                                               args.beta)
+            scores, estimate_dt, dur_last = model.test_forward(
+                sub, rel, obj, time, history_times,
+                node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, args.beta)
 
             mse_loss = torch.nn.MSELoss(reduction='sum')(estimate_dt, dur_last)
             mae_loss = torch.nn.L1Loss(reduction='sum')(estimate_dt, dur_last)
@@ -160,18 +160,15 @@ def train_epoch(args, model, traindataloader, optimizer, scheduler, device, epoc
         bar.set_description('Train')
         total_loss = 0
         total_num = 0
-        for sub, rel, obj, time, history_graphs, history_times, batch_node_ids in traindataloader:
+        for batch in traindataloader:
             if epoch < args.warm_up:
                 scheduler.step()
-            sub = sub.to(device, non_blocking=True)
-            rel = rel.to(device, non_blocking=True)
-            obj = obj.to(device, non_blocking=True)
-            time = time.to(device, non_blocking=True)
-            history_graphs = graph_to_device(history_graphs, device)
-            history_times = history_times.to(device, non_blocking=True)
-            batch_node_ids = batch_node_ids.to(device, non_blocking=True)
+            sub, rel, obj, time, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, history_times = \
+                _batch_to_device(batch, device)
 
-            lp_loss, tp_loss = model.train_forward(sub, rel, obj, time, history_graphs, history_times, batch_node_ids)
+            lp_loss, tp_loss = model.train_forward(
+                sub, rel, obj, time, history_times,
+                node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local)
             loss = lp_loss + args.alpha * tp_loss
             # loss = lp_loss
             loss.backward()

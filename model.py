@@ -83,18 +83,39 @@ class TemporalTransformerHawkesGraphModel(nn.Module):
         nn.init.xavier_uniform_(self.fc2.weight)
         self.tp_loss_fn = nn.MSELoss()
 
-    def forward(self, query_entities, query_relations, history_graphs, history_times, batch_node_ids):
-        bs, hist_len = history_times.size(0), history_times.size(1)
-        history_graphs.ndata['h'] = self.ent_embeds(history_graphs.ndata['id']).view(-1, self.d_model)
-        history_graphs.edata['h'] = self.rel_embeds(history_graphs.edata['type']).view(-1, self.d_model)
-        history_graphs.edata['qrh'] = self.rel_embeds(history_graphs.edata['query_rel']).view(-1, self.d_model)
-        history_graphs.edata['qeh'] = self.ent_embeds(history_graphs.edata['query_ent']).view(-1, self.d_model)
-        total_nodes_h = self.graph_encoder(history_graphs)
+    def forward(self, query_entities, query_relations, history_times,
+                node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local):
+        bs, hist_len, n_nodes = node_ids.size()
+        n_edges = edge_src.size(-1)
+        h = self.ent_embeds(node_ids)
+        e_h = self.rel_embeds(edge_type)
+        qeh = self.ent_embeds(query_entities).view(bs, 1, 1, -1).expand(bs, hist_len, n_edges, -1)
+        qrh = self.rel_embeds(query_relations).view(bs, 1, 1, -1).expand(bs, hist_len, n_edges, -1)
+        bl = bs * hist_len
+        h = h.reshape(bl, n_nodes, self.d_model)
+        src = edge_src.reshape(bl, n_edges)
+        dst = edge_dst.reshape(bl, n_edges)
+        mask = edge_mask.reshape(bl, n_edges)
+        e_h = e_h.reshape(bl, n_edges, self.d_model)
+        qeh = qeh.reshape(bl, n_edges, self.d_model)
+        qrh = qrh.reshape(bl, n_edges, self.d_model)
+        offsets = torch.arange(bl, device=h.device, dtype=torch.long).unsqueeze(1) * n_nodes
+        valid = mask.reshape(-1)
+        src_f = (src + offsets).reshape(-1)[valid]
+        dst_f = (dst + offsets).reshape(-1)[valid]
+        h_f = h.reshape(bl * n_nodes, self.d_model)
+        e_f = e_h.reshape(bl * n_edges, self.d_model)[valid]
+        qeh_f = qeh.reshape(bl * n_edges, self.d_model)[valid]
+        qrh_f = qrh.reshape(bl * n_edges, self.d_model)[valid]
+        total_nodes_h = self.graph_encoder.forward_flat(h_f, src_f, dst_f, e_f, qrh_f, qeh_f)
+        total_nodes_h = total_nodes_h.view(bl, n_nodes, self.d_model)
+        roots = root_local.reshape(bl)
+        history_gh = total_nodes_h[torch.arange(bl, device=h.device), roots].view(bs, hist_len, self.d_model)
         query_rel_embeds = self.rel_embeds(query_relations)
         query_ent_embeds = self.ent_embeds(query_entities)
-        history_gh = total_nodes_h[batch_node_ids].reshape(bs, hist_len, -1)
         history_pad_mask = (history_times == -1).unsqueeze(1)
-        local_type = history_graphs.ndata['id'].reshape([bs, -1])
+        local_type = node_ids.reshape(bs, -1)
+        total_nodes_h = total_nodes_h.reshape(bs, hist_len * n_nodes, self.d_model)
         return query_ent_embeds, query_rel_embeds, history_gh, history_pad_mask, total_nodes_h, local_type
 
     def link_prediction(self, query_time, query_ent_embeds, query_rel_embeds,
@@ -179,9 +200,10 @@ class TemporalTransformerHawkesGraphModel(nn.Module):
         return estimate_dt, dur_last
 
 
-    def train_forward(self, s_ent, relation, o_ent, time, history_graphs, history_times, batch_node_ids):
+    def train_forward(self, s_ent, relation, o_ent, time, history_times,
+                      node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local):
         query_ent_embeds, query_rel_embeds, history_gh, history_pad_mask, total_nodes_h, local_type = \
-            self.forward(s_ent, relation, history_graphs, history_times, batch_node_ids)
+            self.forward(s_ent, relation, history_times, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local)
 
         type_intes, type,statics_ent_embeds = self.link_prediction(time, query_ent_embeds, query_rel_embeds, history_gh, history_times, history_pad_mask,
                                                 total_nodes_h, local_type)
@@ -196,9 +218,10 @@ class TemporalTransformerHawkesGraphModel(nn.Module):
         # loss_tp = 0
         return loss_lp, loss_tp
 
-    def test_forward(self, s_ent, relation, o_ent, time, history_graphs, history_times, batch_node_ids, local_weight=1.):
+    def test_forward(self, s_ent, relation, o_ent, time, history_times,
+                     node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, local_weight=1.):
         query_ent_embeds, query_rel_embeds, history_gh, history_pad_mask, total_nodes_h, local_type = \
-            self.forward(s_ent, relation, history_graphs, history_times, batch_node_ids)
+            self.forward(s_ent, relation, history_times, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local)
 
         type_intes, type,statics_ent_embeds = self.link_prediction(time, query_ent_embeds, query_rel_embeds, history_gh, history_times,
                                                 history_pad_mask,
