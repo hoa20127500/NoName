@@ -3,201 +3,215 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
-from regularizers import N3
-from GraphEmbedding import GraphEmbedding
-from Denoiser import Denoiser
-class NoName(nn.Module):
-    def __init__(self, config, eps=0.2, noise_scale = 0.1, noise_min = 0.001, noise_max = 0.02, steps = 4, beta_fixed=True):
-        super(NoName, self).__init__()
+from models.GraphEncoder import RGTEncoder, RGCNEncoder
+from models.SequenceEncoder import TransformerEncoder
+import torch_scatter
+from models.ConvTransE import ConvTransE
+from embeddings import ProjectedEmbedding
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, eps=0.1, reduction='mean'):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, output, target):
+        c = output.size()[-1]
+        log_preds = F.log_softmax(output, dim=-1)
+        if self.reduction == 'sum':
+            loss = -log_preds.sum()
+        else:
+            loss = -log_preds.sum(dim=-1)
+            if self.reduction == 'mean':
+                loss = loss.mean()
+        return loss*self.eps/c + (1-self.eps) * F.nll_loss(log_preds, target, reduction=self.reduction)
+
+class TemporalTransformerHawkesGraphModel(nn.Module):
+    def __init__(self, config, eps=0.2, time_span=24, timestep=0.1, hmax=5,
+                 ent_pretrained=None, rel_pretrained=None, freeze_pretrained=True):
+        super(TemporalTransformerHawkesGraphModel, self).__init__()
         self.config = config
         self.n_ent = config.n_ent
         self.n_rel = config.n_rel
         self.d_model = config.d_model
         self.dropout_rate = config.dropout
-        self.noise_scale = noise_scale
-        self.noise_min = noise_min
-        self.noise_max = noise_max
-        self.steps = steps
+        self.transformer_layer_num = config.seqTransformerLayerNum
+        self.transformer_head_num = config.seqTransformerHeadNum
+        self.PAD_TIME = -1
+        self.PAD_ENTITY = self.n_ent - 1
+        self.time_span = time_span
+        self.timestep = timestep
+        self.hmax = hmax
+
+        if ent_pretrained is None:
+            self.ent_embeds = nn.Embedding(self.n_ent, self.d_model)
+            nn.init.xavier_uniform_(self.ent_embeds.weight)
+        else:
+            self.ent_embeds = ProjectedEmbedding(
+                self.n_ent, self.d_model, pretrained=ent_pretrained, freeze=freeze_pretrained)
+
+        if rel_pretrained is None:
+            self.rel_embeds = nn.Embedding(self.n_rel, self.d_model)
+            nn.init.xavier_uniform_(self.rel_embeds.weight)
+        else:
+            self.rel_embeds = ProjectedEmbedding(
+                self.n_rel, self.d_model, pretrained=rel_pretrained, freeze=freeze_pretrained)
+        self.graph_encoder = RGTEncoder(self.d_model, self.dropout_rate)
+        # self.graph_encoder = RGCNEncoder(self.d_model, self.n_rel, self.d_model//2, self.dropout_rate)
+        self.seq_encoder = TransformerEncoder(self.d_model, self.d_model, self.transformer_layer_num,
+                                              self.transformer_head_num, self.dropout_rate)
+
+        self.linear_inten_layer = nn.Linear(self.d_model * 2, self.d_model, bias=False)
+        self.time_inten_layer = nn.Linear(self.d_model * 3, self.d_model, bias=False)
+        self.linear_inten_layer1 = nn.Linear(self.d_model * 2, self.d_model, bias=False)
+
         self.dropout = nn.Dropout(self.dropout_rate)
+        self.Softplus = nn.Softplus(beta=0.5)
+        self.lp_loss_fn = LabelSmoothingCrossEntropy(eps)
+
+        self.conv2 = torch.nn.Conv1d(2, 50, 3, stride=1, padding=1)
+        self.bn2 = torch.nn.BatchNorm1d(50)
+        self.fc2 = torch.nn.Linear(self.d_model * 50, self.d_model)
         self.layer_norm = nn.LayerNorm(self.d_model, eps=1e-6)
-        self.emb_regularizer = N3(0.004)
-        self.encoder1 = GraphEmbedding(self.n_ent, self.n_rel,self.d_model, self.dropout_rate, self.dropout_rate, self.dropout_rate)
-        self.encoder2 = GraphEmbedding(self.n_ent, self.n_rel,self.d_model, self.dropout_rate, self.dropout_rate, self.dropout_rate)
-        self.denoiser1 = Denoiser(self.d_model, self.d_model, self.d_model)
-        self.denoiser2 = Denoiser(self.d_model,self.d_model, self.d_model)
 
-        self.betas = torch.tensor(self.get_betas(), dtype=torch.float64).cuda()
-        self.alphas = 1 - self.betas
-        self.sqrt_alphas = torch.sqrt(self.alphas)
-        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.ent_decoder = ConvTransE(self.n_ent,self.d_model, self.dropout_rate, self.dropout_rate, self.dropout_rate)
 
-        self.time_mlp = nn.Linear(self.d_model, self.d_model)
-        self.w = torch.nn.Parameter((torch.from_numpy(1 / 10 ** np.linspace(0, 9, self.d_model))).float(), requires_grad=True)
+        nn.init.xavier_uniform_(self.linear_inten_layer.weight)
+        nn.init.xavier_uniform_(self.time_inten_layer.weight)
+        nn.init.xavier_uniform_(self.linear_inten_layer1.weight)
+        nn.init.xavier_uniform_(self.conv2.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        self.tp_loss_fn = nn.MSELoss()
 
-        self.lp_loss_fn = nn.CrossEntropyLoss()
-    def product(self,a_real, a_img, b_real, b_img):
-        c_real = a_real * b_real - a_img * b_img
-        c_img = a_real * b_img + a_img * b_real
-        return c_real, c_img
-    def get_betas(self):
-        start = self.noise_scale * self.noise_min
-        end = self.noise_scale * self.noise_max
-        variance = np.linspace(start, end, self.steps, dtype=np.float64)
-        alpha_bar = 1 - variance
-        betas = []
-        betas.append(1 - alpha_bar[0])
-        for i in range(1, self.steps):
-          betas.append(min(1 - alpha_bar[i] / alpha_bar[i-1], 0.999))
-        return np.array(betas)
-    def forward(self, heads, rels, tails, day):
-        bs = heads.size(0)
-        d_img = torch.sin(self.w.view(1, -1) * (day + 0.5).unsqueeze(1))
-        d_real = torch.cos(self.w.view(1, -1) * (day - 0.5).unsqueeze(1))
-        rels_embeds_real = d_real * self.encoder1.get_rel_embedding(rels) - d_img * self.encoder2.get_rel_embedding(rels)
-        heads_embeds_real = self.encoder1.get_ent_embedding(heads)
-        tails_embeds_real = self.encoder1.get_ent_embedding(tails)
-        rels_embeds_img = d_real * self.encoder2.get_rel_embedding(rels) + d_img * self.encoder1.get_rel_embedding(rels)
-        heads_embeds_img = self.encoder2.get_ent_embedding(heads)
-        tails_embeds_img = self.encoder2.get_ent_embedding(tails)
-        return heads_embeds_real, rels_embeds_real, tails_embeds_real, heads_embeds_img, rels_embeds_img, tails_embeds_img
+    def forward(self, query_entities, query_relations, history_graphs, history_times, batch_node_ids):
+        bs, hist_len = history_times.size(0), history_times.size(1)
+        history_graphs.ndata['h'] = self.ent_embeds(history_graphs.ndata['id']).view(-1, self.d_model)
+        history_graphs.edata['h'] = self.rel_embeds(history_graphs.edata['type']).view(-1, self.d_model)
+        history_graphs.edata['qrh'] = self.rel_embeds(history_graphs.edata['query_rel']).view(-1, self.d_model)
+        history_graphs.edata['qeh'] = self.ent_embeds(history_graphs.edata['query_ent']).view(-1, self.d_model)
+        total_nodes_h = self.graph_encoder(history_graphs)
+        query_rel_embeds = self.rel_embeds(query_relations)
+        query_ent_embeds = self.ent_embeds(query_entities)
+        history_gh = total_nodes_h[batch_node_ids].reshape(bs, hist_len, -1)
+        history_pad_mask = (history_times == -1).unsqueeze(1)
+        local_type = history_graphs.ndata['id'].reshape([bs, -1])
+        return query_ent_embeds, query_rel_embeds, history_gh, history_pad_mask, total_nodes_h, local_type
+
+    def link_prediction(self, query_time, query_ent_embeds, query_rel_embeds,
+                        history_gh, history_times, history_pad_mask, total_nodes_h, local_type):
+        bs, hist_len = history_times.size(0), history_times.size(1)
+        #seq_query_input = query_rel_embeds.unsqueeze(1)
+        seq_query_time = query_time.view(-1, 1)  # [bs, 1]
+        res_history_gh = self.dropout(torch.cat([query_rel_embeds.unsqueeze(1).repeat(1,hist_len,1),history_gh],dim=-1))
+        res_history_gh = self.dropout(self.conv2(res_history_gh.reshape(bs,2,-1)))
+        res_history_gh = self.bn2(res_history_gh)
+        res_history_gh = res_history_gh.view(bs,hist_len, -1)
+        history_gh = self.dropout(self.fc2(res_history_gh)) + history_gh
+        history_gh = self.layer_norm(history_gh)
+
+
+        seq_query_input = query_rel_embeds.unsqueeze(1)
+
+        output = self.seq_encoder(history_gh, history_times, seq_query_input, seq_query_time, history_pad_mask)
+        output = output[:, -1, :]
+
+        statics_ent_embeds = self.dropout(self.linear_inten_layer(
+            torch.cat((query_ent_embeds, query_rel_embeds), dim=-1)))
+        inten_raw = F.gelu(self.dropout(self.linear_inten_layer1(
+            torch.cat((statics_ent_embeds, output), dim=-1)))) +statics_ent_embeds
+        inten_raw = self.layer_norm(inten_raw)
+        #global_intes = inten_raw.mm(self.ent_embeds.weight.transpose(0, 1))  # [bs, ent_num]
+        global_type = torch.arange(self.n_ent, device=output.device).unsqueeze(0).repeat(bs, 1)
+        global_intes = self.ent_decoder(query_ent_embeds,query_rel_embeds, output,self.ent_embeds.weight)
+
+        local_h = total_nodes_h.reshape([bs, -1, self.d_model])
+
+        local_intes = torch.matmul(statics_ent_embeds.unsqueeze(1), local_h.transpose(1, 2))[:, -1, :]\
+                + torch.matmul(inten_raw.unsqueeze(1), local_h.transpose(1, 2))[:, -1, :]  # [bs, max_nodes_num * seq_len]
+
+        intens = self.Softplus(torch.cat([global_intes, local_intes], dim=-1))
+
+
+        ent_type = torch.cat([global_type, local_type], dim=-1)
+        return intens, ent_type,statics_ent_embeds
+
 
     def link_prediction_loss(self, intens, type, answers):
-        loss = self.lp_loss_fn(intens, answers)
+        intens = torch_scatter.scatter(intens, type, dim=-1, reduce="mean")
+        loss = self.lp_loss_fn(intens[:, :-1], answers)
         return loss
 
-    def q_sample(self, x_start, t, noise=None):
-      if noise is None:
-        noise = torch.randn_like(x_start)
-      return self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start + self._extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+    def time_prediction_loss(self, estimate_dt, dur_last):
+        loss_dt = self.tp_loss_fn(estimate_dt, dur_last)
+        return loss_dt
 
-    def _extract_into_tensor(self, arr, timesteps, broadcast_shape):
-      arr = arr.cuda()
-      res = arr[timesteps].float()
-      while len(res.shape) < len(broadcast_shape):
-        res = res[..., None]
-      return res.expand(broadcast_shape)
+    def ents_score(self, intens, type, local_weight=1.):
+        #intens = F.softmax(intens, dim=-1)
+        #intens[:, self.n_ent:] = intens[:, self.n_ent:] * 0.65
+        output = torch_scatter.scatter(intens, type, dim=-1, reduce="mean")
+        return output[:, :-1]
 
-    def train_forward(self, heads, rels, tails, year, month, day, neg):
-        heads_embs1, rels_embs1, x_start1, \
-        heads_embs2, rels_embs2, x_start2 = self.forward(heads, rels, tails,(month))
-        bs = heads.size(0)
-        ts = torch.randint(0, self.steps,(bs,))
-        d_img = torch.cos(self.w.view(1, -1) * (month + day%month + year % month).unsqueeze(1))
-        d_real = torch.sin(self.w.view(1, -1) *(month + day%month + year % month).unsqueeze(1))
-        #x_t = torch.sqrt(alphas[t]) * obj_embeds + self.betas[t] / torch.sqrt(1 - torch.cumprod(alphas[ : t])) * noise
-        noise = torch.randn_like(x_start1)
-        pos_x_t1 = self.q_sample(x_start1, ts, noise)
-        condition_emb1 = self.encoder1(heads_embs1 + rels_embs1, d_real)
-        noise = torch.randn_like(x_start2)
-        pos_x_t2 = self.q_sample(x_start2, ts, noise)
-        condition_emb2 = self.encoder2(heads_embs2 - rels_embs2, d_img)
-        #condition_emb = query_ent_embeds * query_rel_embeds
-        #condition_emb = self.dropout(query_ent_embeds * time + query_rel_embeds * time)
-        #condition_emb = self.ent_decoder(query_ent_embeds,query_rel_embeds,self.ent_embeds.weight)
+    def predict_t(self, tail_ent, dur_last, query_ent_embeds, query_rel_embeds, history_gh, history_times, history_pad_mask,statics_ent_embeds):
+        n_samples = int(self.hmax / self.timestep) + 1  # add 1 to accomodate zero
+        bs, hist_len = history_times.size(0), history_times.size(1)
+        dur_last = dur_last // self.time_span
+        dur_non_zero_idx = (dur_last > 0).nonzero().squeeze(1)
+        dur_last = dur_last[dur_non_zero_idx].type(torch.float)
+        if not dur_last.numel():
+            return torch.tensor([0.]), torch.tensor([0.])
+        dt = torch.linspace(0, self.hmax, n_samples, device=dur_last.device).repeat(dur_last.shape[0], 1)  # [bs, n_sample]
 
+        seq_query_input = query_rel_embeds[dur_non_zero_idx].unsqueeze(1).repeat(1, n_samples, 1)  # [bs , n_sample, d_model]
+        seq_query_time = history_times[dur_non_zero_idx, -1].unsqueeze(1).repeat(1, n_samples) + dt  # [bs, n_sample]
+        sampled_seq_output = self.seq_encoder(history_gh[dur_non_zero_idx], history_times[dur_non_zero_idx],
+                                              seq_query_input, seq_query_time, history_pad_mask[dur_non_zero_idx])  # [bs, n_sample, d_model]
 
-        neg_x_start1 = self.encoder1.get_ent_embedding(neg)
-        noise = torch.randn_like(neg_x_start1)
-        neg_x_t1 = self.q_sample(neg_x_start1, ts, noise)
+        inten_layer_input = torch.cat((query_ent_embeds[dur_non_zero_idx].unsqueeze(1).repeat(1, n_samples, 1),
+                                    sampled_seq_output, query_rel_embeds[dur_non_zero_idx].unsqueeze(1).repeat(1, n_samples, 1)), dim=-1)
+        inten_raw = self.time_inten_layer(self.dropout(inten_layer_input))  # [bs, n_sample, d_model]
+        o = self.ent_embeds(tail_ent[dur_non_zero_idx]).unsqueeze(1).repeat(1, n_samples, 1)  # [bs, d_model]
+        intensity = self.Softplus((inten_raw * o).sum(dim=2))  # [bs, n_sample]
 
-        neg_x_start2 = self.encoder2.get_ent_embedding(neg)
-        noise = torch.randn_like(neg_x_start2)
-        neg_x_t2 = self.q_sample(neg_x_start2, ts, noise)
-
-        freqs = torch.exp(-math.log(10000) * torch.arange(start=0, end=self.d_model // 2, dtype=torch.float32) / (self.d_model // 2)).to(x_start1.device)
-        temp = ts[:, None].float().to(x_start1.device) * freqs[None]
-        time_embs = torch.cat([torch.cos(temp), torch.sin(temp)], dim=-1)
-        if self.d_model % 2:
-            time_embs = torch.cat([time_embs, torch.zeros_like(time_embs[:, :1])], dim=-1)
-        time_embs = self.time_mlp(time_embs)
-
-        ent_embs1 = torch.cat([pos_x_t1.unsqueeze(1),neg_x_t1],dim = 1)
-        ent_embs2 = torch.cat([pos_x_t2.unsqueeze(1),neg_x_t2],dim = 1)
-        #pos_x_t = 1 / self.sqrt_alphas_cumprod[ts].unsqueeze(1)  * pos_x_t  - \
-        #                torch.sqrt(1 / self.alphas_cumprod[ts] - 1).unsqueeze(1) * self.denoiser(pos_x_t.unsqueeze(1), time_emb.unsqueeze(1), condition_emb.unsqueeze(1)).squeeze(1)
-        ent_embs1 = 1 / self.sqrt_alphas_cumprod[ts].unsqueeze(1).unsqueeze(1) * ent_embs1 - \
-                        torch.sqrt(1 / self.alphas_cumprod[ts].unsqueeze(1).unsqueeze(1) - 0.1) * self.denoiser1(ent_embs1, time_embs, condition_emb1)
-
-        ent_embs2 = 1 / self.sqrt_alphas_cumprod[ts].unsqueeze(1).unsqueeze(1) * ent_embs2 - \
-                        torch.sqrt(1 / self.alphas_cumprod[ts].unsqueeze(1).unsqueeze(1) - 0.1) * self.denoiser2(ent_embs2, time_embs, condition_emb2)
-
-        #condition_emb1 = (heads_embs1 + rels_embs1) * condition_emb1
-        condition_emb1, condition_emb2 = self.product((heads_embs1 + rels_embs1), (heads_embs1 - rels_embs1), condition_emb1, condition_emb2) #condition_emb2 = (heads_embs2 - rels_embs2) * condition_emb2
-        ent_type = torch.cat([tails.unsqueeze(1),neg],dim = 1)
-        type_intes = self.dropout(condition_emb1.multiply(x_start1).unsqueeze(1) \
-                                  - condition_emb1.unsqueeze(1).multiply(ent_embs1)).sum(dim=-1) \
-                                  + self.dropout(condition_emb2.multiply(x_start2).unsqueeze(1) \
-                                  - condition_emb2.unsqueeze(1).multiply(ent_embs2)).sum(dim=-1)
-
-        labels = torch.cat([torch.ones_like(tails).unsqueeze(1), torch.zeros_like(neg)], dim=1)
-        #type_intes = (torch.norm(condition_emb - x_start, dim=1).unsqueeze(1) - torch.norm(condition_emb.unsqueeze(1) - ent_embeds, dim=-1))
-        factor = (torch.linalg.norm(heads_embs1 - x_start1, ord = 2, dim=1), torch.linalg.norm(heads_embs2 -x_start2, ord = 2, dim=1),\
-                  torch.linalg.norm(rels_embs1, ord = 2, dim=1),torch.linalg.norm(rels_embs1, ord = 2, dim=1))
-
-        loss_lp =  self.link_prediction_loss(type_intes, ent_type, torch.zeros_like(tails)) + 5 * contrastive_loss(type_intes, labels)
-
-        return loss_lp.mean() + 5 * self.emb_regularizer.forward(factor)
+        integral_ = torch.cumsum(self.timestep * intensity, dim=1)
+        density = (intensity * torch.exp(-integral_))
+        t_pit = dt * density  # [bs, n_sample]
+        estimate_dt = (self.timestep * 0.5 * (t_pit[:, 1:] + t_pit[:, :-1])).sum(dim=1)  # shape: n_batch
+        return estimate_dt, dur_last
 
 
-    def test_forward(self, sub, rels, tails, year, month, day):
-        heads_embs1, rels_embs1, _, \
-        heads_embs2, rels_embs2, _  = self.forward(sub, rels, tails, (month))
-        d_img = torch.cos(self.w.view(1, -1) * (month + day%month + year % month).unsqueeze(1))
-        d_real = torch.sin(self.w.view(1, -1) * (month + day%month + year % month).unsqueeze(1))
-        condition_emb1 = self.encoder1(heads_embs1 + rels_embs1, d_real)
-        condition_emb2 = self.encoder2(heads_embs2 - rels_embs2, d_img)
-        bs = heads_embs1.size(0)
-        #type_intes, type = self.link_prediction(time, query_ent_embeds, query_rel_embeds)
-        #alphas = 1 - self.betas
-        #alphas_cumprod = torch.cumprod(alphas, axis=0)
-        x_t1 = torch.randn_like(condition_emb1)
-        x_t2 = torch.randn_like(condition_emb2)
-        t = self.steps - 1
-        while t >= 0:
-          freqs = torch.exp(-math.log(10000) * torch.arange(start=0, end=self.d_model // 2, dtype=torch.float32) / (self.d_model // 2)).to(x_t1.device)
-          temp = t * freqs[None].repeat(bs,1)
-          time_embs = torch.cat([torch.cos(temp), torch.sin(temp)], dim=-1)
+    def train_forward(self, s_ent, relation, o_ent, time, history_graphs, history_times, batch_node_ids):
+        query_ent_embeds, query_rel_embeds, history_gh, history_pad_mask, total_nodes_h, local_type = \
+            self.forward(s_ent, relation, history_graphs, history_times, batch_node_ids)
 
-          if self.d_model % 2:
-              time_embs = torch.cat([time_embs, torch.zeros_like(time_embs[:, :1])], dim=-1)
+        type_intes, type,statics_ent_embeds = self.link_prediction(time, query_ent_embeds, query_rel_embeds, history_gh, history_times, history_pad_mask,
+                                                total_nodes_h, local_type)
 
-          time_embs = self.time_mlp(time_embs)
-          x_t1 = 1 / self.sqrt_alphas[t] * (x_t1 - (1 - self.alphas[t]) / self.sqrt_one_minus_alphas_cumprod[t] * \
-                                              self.denoiser1(x_t1.unsqueeze(1), time_embs, condition_emb1).squeeze(1))
-          x_t2 = 1 / self.sqrt_alphas[t] * (x_t2 - (1 - self.alphas[t]) / self.sqrt_one_minus_alphas_cumprod[t] * \
-                                              self.denoiser2(x_t2.unsqueeze(1), time_embs, condition_emb2).squeeze(1))
-          if t > 0:
-            x_t1 += self.betas[t] * torch.randn_like(condition_emb1)
-            x_t2 += self.betas[t] * torch.randn_like(condition_emb2)
-          t -=  1
-        #scores = self.ents_score(type_intes, type, local_weight)
+        last_time, _ = torch.max(history_times, 1)
+        dur_last = time - last_time
+        dur_last = torch.where(last_time > 0, dur_last, torch.zeros_like(dur_last))
+        estimate_dt, dur_last = self.predict_t(o_ent, dur_last, query_ent_embeds, query_rel_embeds, history_gh, history_times, history_pad_mask,statics_ent_embeds)
+
+        loss_lp = self.link_prediction_loss(type_intes, type, o_ent)
+        loss_tp = self.time_prediction_loss(estimate_dt, dur_last)
+        # loss_tp = 0
+        return loss_lp, loss_tp
+
+    def test_forward(self, s_ent, relation, o_ent, time, history_graphs, history_times, batch_node_ids, local_weight=1.):
+        query_ent_embeds, query_rel_embeds, history_gh, history_pad_mask, total_nodes_h, local_type = \
+            self.forward(s_ent, relation, history_graphs, history_times, batch_node_ids)
+
+        type_intes, type,statics_ent_embeds = self.link_prediction(time, query_ent_embeds, query_rel_embeds, history_gh, history_times,
+                                                history_pad_mask,
+                                                total_nodes_h, local_type)
+
+        scores = self.ents_score(type_intes, type, local_weight)
         #
-        #print(x_t)
-        #neg = torch.randint(0, self.n_ent, (bs, 2500)).to(x_t.device)
-        #ent_type =  torch.arange(self.n_ent, device=sub.device).unsqueeze(0).repeat(sub.size(0), 1)
-        #ent_embeds = torch.cat([obj_embeds.unsqueeze(1),ent_embeds],dim = 1)
-        ent_embeds_real = self.encoder1.get_all_ent_embedding()
-        ent_embeds_img = self.encoder2.get_all_ent_embedding()
-        #condition_emb1 = (heads_embs1 + rels_embs1) * condition_emb1
-        condition_emb1, condition_emb2 = self.product((heads_embs1 + rels_embs1), (heads_embs1 - rels_embs1), condition_emb1, condition_emb2) #condition_emb2 = (heads_embs2 - rels_embs2) * condition_emb2
-        scores = F.softplus(self.dropout(condition_emb1.multiply(x_t1).unsqueeze(1)).sum(dim=-1)\
-                      - condition_emb1.mm(ent_embeds_real.transpose(0,1))\
-                      + self.dropout(condition_emb2.multiply(x_t2).unsqueeze(1)).sum(dim=-1)\
-                      - condition_emb2.mm(ent_embeds_img.transpose(0,1)))
+        last_time, _ = torch.max(history_times, 1)
+        dur_last = time - last_time
+        dur_last = torch.where(last_time > 0, dur_last, torch.zeros_like(dur_last))
+        estimate_dt, dur_last = self.predict_t(o_ent, dur_last, query_ent_embeds, query_rel_embeds, history_gh,
+                                               history_times, history_pad_mask,statics_ent_embeds)
+        # estimate_dt = 0
+        # dur_last = 0
 
-        return scores
-
-def contrastive_loss(distances, labels, pos_margin=20, neg_margin=-20.0):
-    """
-    Compute contrastive loss.
-    distances: Pairwise distances between embeddings.
-    labels: Binary labels (1 for positive pairs, 0 for negative pairs).
-    pos_margin: Margin for positive pairs.
-    neg_margin: Margin for negative pairs.
-    """
-    loss_pos = labels * torch.pow(F.relu(distances - pos_margin), 2)
-    loss_neg = (1 - labels) * torch.pow(F.relu(neg_margin - distances), 2)
-    return torch.mean(loss_pos + loss_neg)
+        return scores, estimate_dt, dur_last
