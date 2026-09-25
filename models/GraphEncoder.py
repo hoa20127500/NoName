@@ -1,3 +1,4 @@
+import compat  # noqa: F401 — must run before dgl on Python 3.10+
 import dgl
 import math
 import torch

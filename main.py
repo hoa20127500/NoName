@@ -1,4 +1,5 @@
 import argparse
+import compat  # noqa: F401 — patch collections for DGL on Python 3.10+
 import torch
 import os
 from tqdm import tqdm

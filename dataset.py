@@ -2,6 +2,7 @@ import os.path
 from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+import compat  # noqa: F401 — must run before dgl on Python 3.10+
 import dgl
 import torch
 

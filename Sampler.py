@@ -1,6 +1,7 @@
 from dataset import BaseDataset
 import numpy as np
 import os
+import compat  # noqa: F401 — must run before dgl on Python 3.10+
 import dgl
 import torch
 from collections import defaultdict
