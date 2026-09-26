@@ -150,10 +150,36 @@ class TransformerEncoderLayer(nn.Module):
         output = self.ff(output)
         return output
 
+class FourierLayer(nn.Module):
+    """Residual Fourier mixing over history snapshots (FNet-style).
+
+    Mixes along time then channels with FFT, then a linear map, residual, and LayerNorm.
+    Applied to the snapshot sequence immediately before the temporal transformer.
+    """
+
+    def __init__(self, d_model, dropout=0.1):
+        super(FourierLayer, self).__init__()
+        self.fc = nn.Linear(d_model, d_model, bias=False)
+        self.norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.dropout = nn.Dropout(dropout)
+        nn.init.xavier_uniform_(self.fc.weight)
+
+    def forward(self, x, mask=None):
+        residual = x
+        if mask is not None:
+            pad = mask.squeeze(1) if mask.dim() == 3 else mask
+            x = x.masked_fill(pad.unsqueeze(-1), 0.0)
+        mixed = torch.fft.fft(x.float(), dim=1).real
+        mixed = mixed.to(dtype=residual.dtype)
+        mixed = self.dropout(self.fc(mixed))
+        return self.norm(mixed + residual)
+
+
 class TransformerEncoder(nn.Module):
     def __init__(self, d_model, d_inner, n_layers, n_head, dropout):
         super(TransformerEncoder, self).__init__()
         self.n_head = n_head
+        self.fourier = FourierLayer(d_model, dropout)
         self.layer_stack = nn.ModuleList([
             TransformerEncoderLayer(d_model, d_inner, n_head, dropout)
             for _ in range(n_layers)])
@@ -165,6 +191,7 @@ class TransformerEncoder(nn.Module):
         #
         # src = src + self.position(src_p).unsqueeze(0)
         # tgt = tgt + self.position(tgt_p).unsqueeze(0)
+        src = self.fourier(src, mask)
         for enc_layer in self.layer_stack:
             tgt = enc_layer(src, src_time, tgt, tgt_time, mask)
         return tgt

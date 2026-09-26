@@ -389,10 +389,12 @@ class SnapshotIndex(object):
         self.n_ent = int(n_ent)
         if self.src.size == 0:
             self._src_by_dst = self.src
+            self._rel_by_dst = self.rel
             self._in_ptr = np.zeros(self.n_ent + 1, dtype=np.int64)
             return
         order = np.argsort(self.dst, kind='mergesort')
         self._src_by_dst = self.src[order]
+        self._rel_by_dst = self.rel[order]
         counts = np.bincount(self.dst, minlength=self.n_ent)
         self._in_ptr = np.zeros(self.n_ent + 1, dtype=np.int64)
         np.cumsum(counts, out=self._in_ptr[1:])
@@ -402,6 +404,14 @@ class SnapshotIndex(object):
         if node < 0 or node >= self.n_ent:
             return self._src_by_dst[:0]
         return self._src_by_dst[self._in_ptr[node]:self._in_ptr[node + 1]]
+
+    def in_events(self, node):
+        node = int(node)
+        if node < 0 or node >= self.n_ent:
+            empty = self._src_by_dst[:0]
+            return empty, empty
+        sl = slice(self._in_ptr[node], self._in_ptr[node + 1])
+        return self._src_by_dst[sl], self._rel_by_dst[sl]
 
     def collect_nodes(self, root, n_hop):
         root = int(root)
@@ -486,6 +496,12 @@ class DGLGraphDataset(object):
         snap = self.snapshots_index.get(int(time), self.snapshots_index[-1])
         return snap.make_graph(root_node, n_hop, conf_row)
 
+    def history_events(self, time, root_node):
+        snap = self.snapshots_index.get(int(time), self.snapshots_index[-1])
+        src, rel = snap.in_events(root_node)
+        dst = np.full(src.shape, int(root_node), dtype=np.int64)
+        return src, rel, dst
+
     def get_nhop_subgraph(self, time, root_node, n=2):
         return self.history_graph(time, root_node, n)
 
@@ -536,7 +552,8 @@ class DGLGraphDataset(object):
 
 class QuadruplesDataset(Dataset):
     def __init__(self, quadruples, history_len, dglGraphs, baseDataset, history_mode='recent', nhop=2,
-                 forecasting_t_windows_size=1, time_span=24, edges_conf=None, edge_sample=False, dataset_type='train'):
+                 forecasting_t_windows_size=1, time_span=24, edges_conf=None, edge_sample=False, dataset_type='train',
+                 output_mode='graph', max_events=24):
         self.quadruples = quadruples
         self.history_len = history_len
         self.dglGraphs = dglGraphs
@@ -551,6 +568,8 @@ class QuadruplesDataset(Dataset):
         self.edge_sample = edge_sample
         self.dataset_type = dataset_type
         self.delta_t = 1
+        self.output_mode = output_mode
+        self.max_events = int(max_events)
 
     def __len__(self):
         if self.dataset_type == 'train':
@@ -564,17 +583,25 @@ class QuadruplesDataset(Dataset):
             delta_t = idx % self.forecasting_t_windows_size + 1
             quad = self.quadruples[quad_idx]
             head_entity, relation, tail_entity, timestamp = quad[0], quad[1], quad[2], quad[3]
+            if self.output_mode == 'behavior':
+                events = self.get_history_events(
+                    head_entity, relation, timestamp, self.history_mode, delta_t)
+                return head_entity, relation, tail_entity, timestamp, events
             history_graphs, history_times = \
                 self.get_history_graphs(head_entity, relation, timestamp, self.history_mode, delta_t)
             return head_entity, relation, tail_entity, timestamp, history_graphs, history_times
         else:
             quad = self.quadruples[idx]
             head_entity, relation, tail_entity, timestamp = quad[0], quad[1], quad[2], quad[3]
+            if self.output_mode == 'behavior':
+                events = self.get_history_events(
+                    head_entity, relation, timestamp, self.history_mode, self.delta_t)
+                return head_entity, relation, tail_entity, timestamp, events
             history_graphs, history_times = \
                 self.get_history_graphs(head_entity, relation, timestamp, self.history_mode, self.delta_t)
             return head_entity, relation, tail_entity, timestamp, history_graphs, history_times
 
-    def get_history_graphs(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
+    def _history_times(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
         if sampled_method == 'history_copy':
             times = self.timeInvDict[(head_entity, relation)]
             history_times = times[:times.index(timestamp)]
@@ -603,7 +630,10 @@ class QuadruplesDataset(Dataset):
             times = self.timeInvDict[head_entity]
             history_times = times[:times.index(timestamp)]
             history_times = history_times[max(-self.history_len, -len(history_times)):]
+        return history_times
 
+    def get_history_graphs(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
+        history_times = self._history_times(head_entity, relation, timestamp, sampled_method, delta_t)
         history_graphs = []
         conf_row = self.edges_conf[relation] if self.edge_sample else None
         if conf_row is not None and torch.is_tensor(conf_row):
@@ -611,6 +641,33 @@ class QuadruplesDataset(Dataset):
         for t in history_times:
             history_graphs.append(self.dglGraphs.history_graph(t, head_entity, self.nhop, conf_row))
         return history_graphs, history_times
+
+    def get_history_events(self, head_entity, relation, timestamp, sampled_method='recent', delta_t=1):
+        history_times = self._history_times(head_entity, relation, timestamp, sampled_method, delta_t)
+        empty = np.zeros(0, dtype=np.int64)
+        srcs, rels, dsts, times = [], [], [], []
+        for t in history_times:
+            if int(t) < 0:
+                continue
+            src, rel, dst = self.dglGraphs.history_events(t, head_entity)
+            if src.size == 0:
+                continue
+            srcs.append(src)
+            rels.append(rel)
+            dsts.append(dst)
+            times.append(np.full(src.shape, int(t), dtype=np.int64))
+        if not srcs:
+            return empty, empty, empty, empty
+        src = np.concatenate(srcs)
+        rel = np.concatenate(rels)
+        dst = np.concatenate(dsts)
+        ts = np.concatenate(times)
+        if src.size > self.max_events:
+            src = src[-self.max_events:]
+            rel = rel[-self.max_events:]
+            dst = dst[-self.max_events:]
+            ts = ts[-self.max_events:]
+        return src, rel, dst, ts
 
     @staticmethod
     def collate_fn(batch, pad_entity):
@@ -673,4 +730,41 @@ class QuadruplesDataset(Dataset):
             edge_mask,
             root_local,
             pad_history_times,
+        )
+
+    @staticmethod
+    def collate_behavior(batch):
+        batch_data = list(zip(*batch))
+        heads = batch_data[0]
+        relations = batch_data[1]
+        tails = batch_data[2]
+        timestamps = batch_data[3]
+        events = batch_data[4]
+        bs = len(heads)
+        max_e = max((len(ev[0]) for ev in events), default=1)
+        max_e = max(int(max_e), 1)
+        ev_src = torch.zeros(bs, max_e, dtype=torch.long)
+        ev_rel = torch.zeros(bs, max_e, dtype=torch.long)
+        ev_dst = torch.zeros(bs, max_e, dtype=torch.long)
+        ev_time = torch.full((bs, max_e), -1, dtype=torch.long)
+        ev_mask = torch.zeros(bs, max_e, dtype=torch.bool)
+        for i, (src, rel, dst, ts) in enumerate(events):
+            n = int(len(src))
+            if n == 0:
+                continue
+            ev_src[i, :n] = torch.from_numpy(np.ascontiguousarray(src, dtype=np.int64))
+            ev_rel[i, :n] = torch.from_numpy(np.ascontiguousarray(rel, dtype=np.int64))
+            ev_dst[i, :n] = torch.from_numpy(np.ascontiguousarray(dst, dtype=np.int64))
+            ev_time[i, :n] = torch.from_numpy(np.ascontiguousarray(ts, dtype=np.int64))
+            ev_mask[i, :n] = True
+        return (
+            torch.tensor(heads),
+            torch.tensor(relations),
+            torch.tensor(tails),
+            torch.tensor(timestamps),
+            ev_src,
+            ev_rel,
+            ev_dst,
+            ev_time,
+            ev_mask,
         )

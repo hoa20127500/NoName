@@ -21,14 +21,18 @@ def parse_args(args=None):
 
     parser.add_argument('--data_root', type=str, default='data')
     parser.add_argument('--output_root', type=str, default='output')
-    parser.add_argument('--model_name', type=str, default='GHT')
+    parser.add_argument('--model_name', type=str, default='GHT',
+                        help='GHT: graph+temporal transformer. BehaviorLM: pretrained LLM on event traces.')
     parser.add_argument('--batch_size', type=int, default=256)
 
     parser.add_argument('--num_works', type=int, default=0,
                         help='DataLoader workers. 0 is required on Colab (each worker copies the full TKG).')
 
     parser.add_argument('--grad_norm', type=float, default=1.0)
-    parser.add_argument('--weight_decay', type=float, default=0.00001)
+    parser.add_argument('--weight_decay', type=float, default=0.0001,
+                        help='AdamW L2 on non-embedding weights.')
+    parser.add_argument('--emb_weight_decay', type=float, default=0.01,
+                        help='Stronger L2 on entity/relation tables; they memorize fastest.')
 
     parser.add_argument('--d_model', default=100, type=int,
                         help='GHT hidden size. Qwen embeddings are 1024-d; they are reduced to this.')
@@ -39,7 +43,12 @@ def parse_args(args=None):
     parser.add_argument('--lr', default=0.003, type=float)
     parser.add_argument('--do_train', action='store_true')
     parser.add_argument('--do_test', action='store_true')
-    parser.add_argument('--valid_epoch', default=5, type=int)
+    parser.add_argument('--valid_epoch', default=2, type=int,
+                        help='Validate every N epochs so the peak is not missed.')
+    parser.add_argument('--patience', default=1, type=int,
+                        help='Stop after this many validations without Filter MRR gain. 0 disables.')
+    parser.add_argument('--lr_decay', default=0.5, type=float,
+                        help='Multiply LR after a validation that does not improve Filter MRR.')
     parser.add_argument('--history_len', default=10, type=int)
     parser.add_argument('--dropout', default=0.5, type=float)
 
@@ -58,8 +67,11 @@ def parse_args(args=None):
     parser.add_argument('--time_span', default=24, type=int)
     parser.add_argument('--timestep', default=0.1, type=float)
     parser.add_argument('--hmax', default=5, type=int)
-    parser.add_argument('--eps', default=0.1, type=float)
-    parser.add_argument('--edge_sample', default='one_hop_conf', type=str)
+    parser.add_argument('--eps', default=0.2, type=float)
+    parser.add_argument('--edge_sample', default='one_hop_conf',
+                        choices=['one_hop_conf', 'none'],
+                        help='one_hop_conf: filter 1-hop edges with data/<dataset>/conf.pkl. '
+                             'none: skip conf.pkl and keep all 1-hop edges.')
     parser.add_argument('--desc', default='', type=str)
 
     parser.add_argument('--warm_up', default=0.0, type=float)
@@ -72,15 +84,72 @@ def parse_args(args=None):
     parser.add_argument('--emb_max_length', default=128, type=int)
     parser.add_argument('--tune_pretrained_emb', action='store_true',
                         help='Fine-tune the pretrained tables instead of freezing them (projection still trains)')
+    parser.add_argument('--lm_model', default='Qwen/Qwen2.5-0.5B-Instruct',
+                        help='Causal LM for BehaviorLM. 0.5B fits Colab Free T4; 1.5B is tighter.')
+    parser.add_argument('--lm_max_length', default=256, type=int)
+    parser.add_argument('--lm_max_events', default=24, type=int,
+                        help='Cap on past events packed into one BehaviorLM prompt.')
+    parser.add_argument('--lm_tune', action='store_true',
+                        help='Finetune the LM backbone (needs more GPU). Default: freeze LM, train projector.')
 
     return parser.parse_args(args)
 
-def _make_loader(dataset, batch_size, num_workers, shuffle, pad_entity):
+
+def _metric_float(value):
+    if torch.is_tensor(value):
+        return float(value.item())
+    return float(value)
+
+
+def _adamw_param_groups(model, weight_decay, emb_weight_decay):
+    if not hasattr(model, 'ent_embeds'):
+        return [{'params': [p for p in model.parameters() if p.requires_grad],
+                 'weight_decay': weight_decay}]
+    emb_ids = {id(param) for param in list(model.ent_embeds.parameters()) + list(model.rel_embeds.parameters())}
+    other, embeds = [], []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in emb_ids:
+            embeds.append(param)
+        else:
+            other.append(param)
+    return [
+        {'params': other, 'weight_decay': weight_decay},
+        {'params': embeds, 'weight_decay': emb_weight_decay},
+    ]
+
+
+def _run_train_forward(model, batch, args):
+    if args.model_name == 'BehaviorLM':
+        sub, rel, obj, time, ev_src, ev_rel, ev_dst, ev_time, ev_mask = batch
+        return model.train_forward(sub, rel, obj, time, ev_src, ev_rel, ev_dst, ev_time, ev_mask)
+    sub, rel, obj, time, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, history_times = batch
+    return model.train_forward(
+        sub, rel, obj, time, history_times,
+        node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local)
+
+
+def _run_test_forward(model, batch, args):
+    if args.model_name == 'BehaviorLM':
+        sub, rel, obj, time, ev_src, ev_rel, ev_dst, ev_time, ev_mask = batch
+        return model.test_forward(sub, rel, obj, time, ev_src, ev_rel, ev_dst, ev_time, ev_mask, args.beta)
+    sub, rel, obj, time, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, history_times = batch
+    return model.test_forward(
+        sub, rel, obj, time, history_times,
+        node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, args.beta)
+
+
+def _make_loader(dataset, batch_size, num_workers, shuffle, pad_entity, output_mode='graph'):
+    if output_mode == 'behavior':
+        collate_fn = lambda x: dataset.collate_behavior(x)
+    else:
+        collate_fn = lambda x: dataset.collate_fn(x, pad_entity)
     kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=lambda x: dataset.collate_fn(x, pad_entity),
+        collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=False,
     )
@@ -100,12 +169,9 @@ def test(model, testloader, skip_dict, device):
     TimeMAE = 0.
     with torch.no_grad():
         for batch in tqdm(testloader):
-            sub, rel, obj, time, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, history_times = \
-                _batch_to_device(batch, device)
-
-            scores, estimate_dt, dur_last = model.test_forward(
-                sub, rel, obj, time, history_times,
-                node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, args.beta)
+            batch = _batch_to_device(batch, device)
+            sub, rel, obj, time = batch[0], batch[1], batch[2], batch[3]
+            scores, estimate_dt, dur_last = _run_test_forward(model, batch, args)
 
             mse_loss = torch.nn.MSELoss(reduction='sum')(estimate_dt, dur_last)
             mae_loss = torch.nn.L1Loss(reduction='sum')(estimate_dt, dur_last)
@@ -163,12 +229,8 @@ def train_epoch(args, model, traindataloader, optimizer, scheduler, device, epoc
         for batch in traindataloader:
             if epoch < args.warm_up:
                 scheduler.step()
-            sub, rel, obj, time, node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local, history_times = \
-                _batch_to_device(batch, device)
-
-            lp_loss, tp_loss = model.train_forward(
-                sub, rel, obj, time, history_times,
-                node_ids, edge_src, edge_dst, edge_type, edge_mask, root_local)
+            batch = _batch_to_device(batch, device)
+            lp_loss, tp_loss = _run_train_forward(model, batch, args)
             loss = lp_loss + args.alpha * tp_loss
             # loss = lp_loss
             loss.backward()
@@ -228,28 +290,36 @@ def main(args):
             data_path, trainQuadruples, baseDataset.num_r))
         edge_sample = True
     else:
+        logging.info('Skipping conf.pkl (edge_sample=none); using full 1-hop graphs')
         edges_conf = None
         edge_sample = False
+    output_mode = 'behavior' if args.model_name == 'BehaviorLM' else 'graph'
+    if args.model_name == 'BehaviorLM' and args.batch_size > 16:
+        logging.info('BehaviorLM: lowering batch_size %d -> 8 for the LLM encoder', args.batch_size)
+        args.batch_size = 8
     trainQuadDataset = QuadruplesDataset(trainQuadruples, args.history_len, dglGraphDataset, baseDataset,
                                          args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
-                                         edges_conf, edge_sample, 'train')
+                                         edges_conf, edge_sample, 'train',
+                                         output_mode, args.lm_max_events)
     trainDataLoader = _make_loader(
-        trainQuadDataset, args.batch_size, args.num_works, True, baseDataset.num_e)
+        trainQuadDataset, args.batch_size, args.num_works, True, baseDataset.num_e, output_mode)
 
 
     validQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.validQuadruples, baseDataset.num_r)
     validQuadDataset = QuadruplesDataset(validQuadruples, args.history_len, dglGraphDataset, baseDataset,
                                         args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
-                                        edges_conf, edge_sample, 'test')
+                                        edges_conf, edge_sample, 'test',
+                                        output_mode, args.lm_max_events)
     validDataLoader = _make_loader(
-        validQuadDataset, args.batch_size, args.num_works, False, baseDataset.num_e)
+        validQuadDataset, args.batch_size, args.num_works, False, baseDataset.num_e, output_mode)
 
     testQuadruples = baseDataset.get_reverse_quadruples_array(baseDataset.testQuadruples, baseDataset.num_r)
     testQuadDataset = QuadruplesDataset(testQuadruples, args.history_len, dglGraphDataset, baseDataset,
                                         args.history_mode, args.nhop, args.forecasting_t_win_size, args.time_span,
-                                        edges_conf, edge_sample, 'test')
+                                        edges_conf, edge_sample, 'test',
+                                        output_mode, args.lm_max_events)
     testDataLoader = _make_loader(
-        testQuadDataset, args.batch_size, args.num_works, False, baseDataset.num_e)
+        testQuadDataset, args.batch_size, args.num_works, False, baseDataset.num_e, output_mode)
 
     Config = namedtuple('config', ['n_ent', 'd_model', 'n_rel', 'dropout','seqTransformerLayerNum', 'seqTransformerHeadNum'])
     config = Config(n_ent=baseDataset.num_e + 1,
@@ -260,7 +330,7 @@ def main(args):
                     seqTransformerHeadNum=args.seqTransformerHeadNum)
     ent_pretrained = rel_pretrained = None
     freeze_pretrained = not args.tune_pretrained_emb
-    if args.emb_init == 'pretrained':
+    if args.model_name != 'BehaviorLM' and args.emb_init == 'pretrained':
         ent_pretrained, rel_pretrained = load_pretrained_tables(
             data_path,
             baseDataset.num_e,
@@ -277,13 +347,28 @@ def main(args):
             ent_pretrained, rel_pretrained = pca_reduce_tables(
                 ent_pretrained, rel_pretrained, args.d_model)
 
-    model = TemporalTransformerHawkesGraphModel(
-        config, args.eps, args.time_span, args.timestep, args.hmax,
-        ent_pretrained=ent_pretrained, rel_pretrained=rel_pretrained,
-        freeze_pretrained=freeze_pretrained)
+    if args.model_name == 'BehaviorLM':
+        from models.BehaviorLM import BehaviorLM
+        model = BehaviorLM(
+            n_ent=config.n_ent,
+            n_rel=config.n_rel,
+            data_dir=data_path,
+            lm_model=args.lm_model,
+            max_length=args.lm_max_length,
+            dropout=args.dropout,
+            eps=args.eps,
+            freeze_lm=not args.lm_tune,
+        )
+    else:
+        model = TemporalTransformerHawkesGraphModel(
+            config, args.eps, args.time_span, args.timestep, args.hmax,
+            ent_pretrained=ent_pretrained, rel_pretrained=rel_pretrained,
+            freeze_pretrained=freeze_pretrained)
     model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        _adamw_param_groups(model, args.weight_decay, args.emb_weight_decay),
+        lr=args.lr)
     if args.warm_up > 0:
         warmup_scheduler = WarmUpLR(optimizer, len(trainDataLoader) * args.warm_up)
     else:
@@ -295,33 +380,65 @@ def main(args):
         optimizer.load_state_dict(params['optimizer_state_dict'])
         logging.info('Load pretrain model: {}'.format(args.load_model_path))
 
+    def _save_ckpt(path):
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, path)
+
     if args.do_train:
         logging.info('Start Training......')
+        best_mrr = -1.0
+        bad_rounds = 0
+        best_path = os.path.join(output_path, 'model_best.pth')
 
         for i in range(args.max_epochs):
-            if i % args.valid_epoch == 0 and i != 0:
-                model_save_path = os.path.join(output_path, 'model_{}.pth'.format(i))
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, model_save_path)
-
-                for delta_t in range(args.forecasting_t_win_size):
-                    delta_t = delta_t + 1
-                    testDataLoader.dataset.delta_t = delta_t
-                    metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
-
-                    for mode in metrics.keys():
-                        logging.info('Delta_t {} Valid {} : {}'.format(delta_t, mode, metrics[mode]))
-
             train_epoch(args, model, trainDataLoader, optimizer, warmup_scheduler, device, i)
+            if (i + 1) % args.valid_epoch != 0:
+                continue
+
+            _save_ckpt(os.path.join(output_path, 'model_{}.pth'.format(i + 1)))
+
+            valid_mrr = None
+            for win in range(args.forecasting_t_win_size):
+                delta_t = win + 1
+                validDataLoader.dataset.delta_t = delta_t
+                metrics = test(model, validDataLoader, baseDataset.skip_dict, device)
+                for mode in metrics.keys():
+                    logging.info('Delta_t {} Valid {} : {}'.format(delta_t, mode, metrics[mode]))
+                if valid_mrr is None:
+                    valid_mrr = _metric_float(metrics['Time-aware Filter MRR'])
+
+            if valid_mrr > best_mrr:
+                best_mrr = valid_mrr
+                bad_rounds = 0
+                _save_ckpt(best_path)
+                logging.info('New best Filter MRR {:.4f} at epoch {}'.format(best_mrr, i + 1))
+            else:
+                bad_rounds += 1
+                old_lr = optimizer.param_groups[0]['lr']
+                if 0.0 < args.lr_decay < 1.0:
+                    for group in optimizer.param_groups:
+                        group['lr'] *= args.lr_decay
+                logging.info(
+                    'Valid Filter MRR {:.4f} < best {:.4f}. LR {:.6f} -> {:.6f} (bad {}/{})'.format(
+                        valid_mrr, best_mrr, old_lr, optimizer.param_groups[0]['lr'],
+                        bad_rounds, args.patience))
+                if args.patience > 0 and bad_rounds >= args.patience:
+                    logging.info('Early stopping at epoch {}'.format(i + 1))
+                    break
+
+        if os.path.isfile(best_path):
+            params = torch.load(best_path, map_location=device)
+            model.load_state_dict(params['model_state_dict'])
+            logging.info('Loaded best model (Filter MRR {:.4f}) from {}'.format(best_mrr, best_path))
 
     if args.do_test:
         logging.info('Start Testing......')
-        for delta_t in range(args.forecasting_t_win_size):
-            delta_t = delta_t + 1
-            validDataLoader.dataset.delta_t = delta_t
-            metrics = test(model, validDataLoader, baseDataset.skip_dict, device)
+        for win in range(args.forecasting_t_win_size):
+            delta_t = win + 1
+            testDataLoader.dataset.delta_t = delta_t
+            metrics = test(model, testDataLoader, baseDataset.skip_dict, device)
             for mode in metrics.keys():
                 logging.info('Delta_t {} Test {} : {}'.format(delta_t, mode, metrics[mode]))
 
